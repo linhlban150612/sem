@@ -99,19 +99,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 Some(p) => format!("{p}::{base_name}"),
                 None => base_name,
             };
-            let truncated = if display_name.len() > 25 {
-                format!(
-                    "{}…",
-                    display_name
-                        .char_indices()
-                        .nth(24)
-                        .map(|(i, _)| &display_name[..i])
-                        .unwrap_or(&display_name)
-                )
-            } else {
-                display_name
-            };
-            let name_label = format!("{:<25}", truncated);
+            let name_label = format!("{:<25}", display_name);
 
             lines.push(format!(
                 "{}  {} {} {} {}",
