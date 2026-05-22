@@ -42,4 +42,12 @@ pkgs.rustPlatform.buildRustPackage rec {
   #     --fish ./autocompletion/${pname}.fish \
   #     --zsh  ./autocompletion/_${pname}
   # '';
+
+  meta = {
+    description = "Semantic version control CLI";
+    homepage = "https://github.com/Ataraxy-Labs/sem";
+    license = with lib.licenses; [mit asl20];
+    mainProgram = "sem";
+    platforms = lib.platforms.unix;
+  };
 }
