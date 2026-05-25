@@ -1,9 +1,9 @@
 class Sem < Formula
   desc "Semantic version control CLI — entity-level diffs on top of Git"
   homepage "https://github.com/Ataraxy-Labs/sem"
-  url "https://github.com/Ataraxy-Labs/sem/archive/refs/tags/v0.6.0.tar.gz"
-  # TODO: update sha256 once v0.6.0 release tarball is published
-  sha256 "50a465bbbefd80ae134a2bbd55a650084075cc0919621e733d617e02ce6e8d74"
+  url "https://github.com/Ataraxy-Labs/sem/archive/refs/tags/v0.6.1.tar.gz"
+  # TODO: update sha256 once v0.6.1 release tarball is published
+  sha256 ""
   license "MIT"
   head "https://github.com/Ataraxy-Labs/sem.git", branch: "main"
 
