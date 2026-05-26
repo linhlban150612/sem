@@ -533,4 +533,36 @@ mod tests {
         assert_eq!(result.changes[0].entity_name, "foo");
         assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.py"));
     }
+
+    #[test]
+    fn duplicate_markdown_heading_reports_first_section_modification() {
+        let before = "# Same Title\n\noriginal content of section A\n\n# Same Title\n\ncontent of section B\n";
+        let after = "# Same Title\n\nMODIFIED content of section A\n\n# Same Title\n\ncontent of section B\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[modified_file("doc.md", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        assert_eq!(result.modified_count, 1, "{:?}", result.changes);
+        assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+
+        let change = &result.changes[0];
+        assert_eq!(change.change_type, ChangeType::Modified);
+        assert_eq!(change.entity_name, "Same Title");
+        assert_eq!(change.entity_line, 1);
+        assert!(change
+            .before_content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("original content of section A"));
+        assert!(change
+            .after_content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("MODIFIED content of section A"));
+    }
 }
