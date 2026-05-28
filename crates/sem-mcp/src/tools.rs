@@ -16,8 +16,11 @@ impl EntitiesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DiffParams {
-    #[schemars(description = "Base ref to compare from (branch, tag, or commit hash, e.g. 'main'). If omitted, shows working-tree changes (like `sem diff`).")]
+    #[schemars(
+        description = "Base ref to compare from (branch, tag, or commit hash, e.g. 'main'). If omitted, shows working-tree changes (like `sem diff`)."
+    )]
     pub base_ref: Option<String>,
     #[schemars(description = "Target ref to compare to. Defaults to HEAD.")]
     pub target_ref: Option<String>,
@@ -26,22 +29,27 @@ pub struct DiffParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BlameParams {
     #[schemars(description = "Path to the file (relative to repo root or absolute)")]
     pub file_path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactAnalysisParams {
     #[schemars(description = "Path to the file containing the entity")]
     pub file_path: String,
     #[schemars(description = "Name of the entity to analyze impact for")]
     pub entity_name: String,
-    #[schemars(description = "Analysis mode: 'all' (default, shows deps + dependents + transitive impact + tests), 'deps' (direct dependencies only), 'dependents' (direct dependents only), 'tests' (affected test entities only)")]
+    #[schemars(
+        description = "Analysis mode: 'all' (default, shows deps + dependents + transitive impact + tests), 'deps' (direct dependencies only), 'dependents' (direct dependents only), 'tests' (affected test entities only)"
+    )]
     pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogParams {
     #[schemars(description = "Name of the entity to trace history for")]
     pub entity_name: String,
@@ -52,6 +60,7 @@ pub struct LogParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ContextParams {
     #[schemars(description = "Path to the file containing the entity")]
     pub file_path: String,
@@ -63,7 +72,30 @@ pub struct ContextParams {
 
 #[cfg(test)]
 mod tests {
-    use super::EntitiesParams;
+    use super::*;
+    use rmcp::handler::server::tool::parse_json_object;
+    use rmcp::model::ErrorCode;
+    use serde::de::DeserializeOwned;
+    use std::fmt::Debug;
+
+    fn assert_unknown_fields_return_invalid_params<T>()
+    where
+        T: Debug + DeserializeOwned,
+    {
+        let arguments = serde_json::json!({
+            "deliberate_bogus_field": 1
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let err = parse_json_object::<T>(arguments).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("unknown field"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn entities_params_accepts_path() {
@@ -81,12 +113,12 @@ mod tests {
     }
 
     #[test]
-    fn entities_params_rejects_unknown_fields() {
-        let err = serde_json::from_value::<EntitiesParams>(serde_json::json!({
-            "unexpected": "src/lib.rs"
-        }))
-        .unwrap_err();
-
-        assert!(err.to_string().contains("unknown field"));
+    fn all_tool_params_return_invalid_params_for_unknown_fields() {
+        assert_unknown_fields_return_invalid_params::<EntitiesParams>();
+        assert_unknown_fields_return_invalid_params::<DiffParams>();
+        assert_unknown_fields_return_invalid_params::<BlameParams>();
+        assert_unknown_fields_return_invalid_params::<ImpactAnalysisParams>();
+        assert_unknown_fields_return_invalid_params::<LogParams>();
+        assert_unknown_fields_return_invalid_params::<ContextParams>();
     }
 }
