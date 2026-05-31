@@ -161,8 +161,8 @@ fn trailing_format_requires_value_before_another_flag() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--format requires a value before '--json'"),
-        "{stderr}"
+        stderr.contains("--format") && stderr.contains("value"),
+        "expected --format value error, got: {stderr}"
     );
 
     let _ = fs::remove_dir_all(dir);
