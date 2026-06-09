@@ -505,14 +505,8 @@ const AMBIGUOUS_NAMES: &[&str] = &[
     "apply", "call", "bind", "get", "set", "run", "execute", "create",
 ];
 
-/// Path components that indicate test/fixture files (not production source).
-const TEST_PATH_MARKERS: &[&str] = &[
-    "test", "tests", "spec", "specs", "fixtures", "fixture",
-    "benchmarks", "benchmark", "__tests__", "__mocks__",
-];
-
 fn is_test_or_fixture_path(path: &str) -> bool {
-    path.split('/').any(|component| TEST_PATH_MARKERS.contains(&component))
+    crate::parser::test_detect::is_test_path(path)
 }
 
 /// Find arity mismatches across all Calls edges in the graph.

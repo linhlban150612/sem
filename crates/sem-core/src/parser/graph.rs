@@ -2617,9 +2617,19 @@ impl EntityGraph {
         &self,
         entities: &[crate::model::entity::SemanticEntity],
     ) -> HashSet<String> {
+        self.filter_test_entities_with_custom_dirs(entities, &[])
+    }
+
+    /// Like [`filter_test_entities`], but also considers user-configured
+    /// test directories from `.semrc`.
+    pub fn filter_test_entities_with_custom_dirs(
+        &self,
+        entities: &[crate::model::entity::SemanticEntity],
+        custom_test_dirs: &[String],
+    ) -> HashSet<String> {
         let mut test_ids = HashSet::new();
         for entity in entities {
-            if is_test_entity(entity) {
+            if is_test_entity(entity, custom_test_dirs) {
                 test_ids.insert(entity.id.clone());
             }
         }
@@ -2633,7 +2643,18 @@ impl EntityGraph {
         entity_id: &str,
         all_entities: &[crate::model::entity::SemanticEntity],
     ) -> Vec<&EntityInfo> {
-        let test_ids = self.filter_test_entities(all_entities);
+        self.test_impact_with_custom_dirs(entity_id, all_entities, &[])
+    }
+
+    /// Like [`test_impact`], but also considers user-configured test
+    /// directories from `.semrc`.
+    pub fn test_impact_with_custom_dirs(
+        &self,
+        entity_id: &str,
+        all_entities: &[crate::model::entity::SemanticEntity],
+        custom_test_dirs: &[String],
+    ) -> Vec<&EntityInfo> {
+        let test_ids = self.filter_test_entities_with_custom_dirs(all_entities, custom_test_dirs);
         let impact = self.impact_analysis(entity_id);
         impact
             .into_iter()
@@ -2921,9 +2942,8 @@ fn is_scope_member_container(entity_type: &str) -> bool {
 }
 
 /// Check if an entity looks like a test based on name, file path, and content patterns.
-fn is_test_entity(entity: &crate::model::entity::SemanticEntity) -> bool {
+fn is_test_entity(entity: &crate::model::entity::SemanticEntity, custom_test_dirs: &[String]) -> bool {
     let name = &entity.name;
-    let path = &entity.file_path;
     let content = &entity.content;
 
     // Name patterns
@@ -2938,15 +2958,9 @@ fn is_test_entity(entity: &crate::model::entity::SemanticEntity) -> bool {
         return true;
     }
 
-    // File path patterns
-    let path_lower = path.to_lowercase();
-    let in_test_file = path_lower.contains("/test/")
-        || path_lower.contains("/tests/")
-        || path_lower.contains("/spec/")
-        || path_lower.contains("_test.")
-        || path_lower.contains(".test.")
-        || path_lower.contains("_spec.")
-        || path_lower.contains(".spec.");
+    // File path patterns (shared detection)
+    let in_test_file =
+        crate::parser::test_detect::is_test_path_with_custom_dirs(&entity.file_path, custom_test_dirs);
 
     // Content patterns (test annotations/decorators)
     let has_test_marker = content.contains("#[test]")
@@ -8639,5 +8653,114 @@ export function caller() {
             "greet should depend on capitalize-first via multi-line :refer. Deps: {:?}",
             deps.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
+    }
+
+    // ── is_test_entity / filter_test_entities tests ─────────────────────
+
+    fn make_entity(name: &str, file_path: &str, content: &str) -> SemanticEntity {
+        SemanticEntity {
+            id: format!("{}::function::{}", file_path, name),
+            name: name.to_string(),
+            entity_type: "function".to_string(),
+            file_path: file_path.to_string(),
+            start_line: 1,
+            end_line: 5,
+            content: content.to_string(),
+            content_hash: String::new(),
+            structural_hash: None,
+            parent_id: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_entity_detected_by_name_pattern() {
+        let entity = make_entity("test_login", "src/auth.py", "def test_login(): pass");
+        assert!(is_test_entity(&entity, &[]));
+    }
+
+    #[test]
+    fn test_entity_detected_by_path_and_content_marker() {
+        // Path match + content marker both required
+        let entity = make_entity("run", "e2e-tests/login.ts", "describe('login', () => { it('works', () => {}) })");
+        assert!(is_test_entity(&entity, &[]));
+    }
+
+    #[test]
+    fn test_entity_not_detected_in_production_code() {
+        let entity = make_entity("handle_request", "src/server.rs", "fn handle_request() {}");
+        assert!(!is_test_entity(&entity, &[]));
+    }
+
+    #[test]
+    fn test_entity_path_match_without_content_marker_not_detected() {
+        // Path says test dir, but content has no test marker → not a test
+        let entity = make_entity("helper", "tests/helpers.py", "def helper(): return 42");
+        assert!(!is_test_entity(&entity, &[]));
+    }
+
+    #[test]
+    fn test_entity_detected_in_hyphenated_test_dir() {
+        let entity = make_entity("check", "integration-tests/api.py", "@pytest.mark.slow\ndef check(): pass");
+        assert!(is_test_entity(&entity, &[]));
+    }
+
+    #[test]
+    fn test_entity_detected_in_dunder_tests_dir() {
+        let entity = make_entity("render", "__tests__/Button.test.tsx", "test('renders', () => {})");
+        assert!(is_test_entity(&entity, &[]));
+    }
+
+    #[test]
+    fn test_entity_detected_with_custom_dir() {
+        let entity = make_entity("verify", "qa/smoke.py", "@pytest.fixture\ndef verify(): pass");
+        // Without custom dirs: not detected (no name match, "qa" not a built-in)
+        assert!(!is_test_entity(&entity, &[]));
+        // With custom dirs: detected because path matches + content has @pytest
+        let custom = vec!["qa".to_string()];
+        assert!(is_test_entity(&entity, &custom));
+    }
+
+    #[test]
+    fn test_entity_contest_dir_not_false_positive() {
+        let entity = make_entity("solve", "contest/problem_a.py", "def solve(): test('input')");
+        assert!(!is_test_entity(&entity, &[]));
+    }
+
+    #[test]
+    fn filter_test_entities_with_custom_dirs_includes_custom_matches() {
+        let entities = vec![
+            make_entity("test_a", "src/lib.rs", "#[test]\nfn test_a() {}"),
+            make_entity("run", "qa/smoke.rs", "#[test]\nfn run() {}"),
+            make_entity("main", "src/main.rs", "fn main() {}"),
+        ];
+        let entity_map: std::collections::HashMap<String, EntityInfo> = entities
+            .iter()
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    EntityInfo {
+                        id: e.id.clone(),
+                        name: e.name.clone(),
+                        entity_type: e.entity_type.clone(),
+                        file_path: e.file_path.clone(),
+                        parent_id: None,
+                        start_line: e.start_line,
+                        end_line: e.end_line,
+                    },
+                )
+            })
+            .collect();
+        let graph = EntityGraph::from_parts(entity_map, vec![]);
+
+        let builtin = graph.filter_test_entities(&entities);
+        assert!(builtin.contains("src/lib.rs::function::test_a"));
+        assert!(!builtin.contains("qa/smoke.rs::function::run"));
+
+        let custom = vec!["qa".to_string()];
+        let with_custom = graph.filter_test_entities_with_custom_dirs(&entities, &custom);
+        assert!(with_custom.contains("src/lib.rs::function::test_a"));
+        assert!(with_custom.contains("qa/smoke.rs::function::run"));
+        assert!(!with_custom.contains("src/main.rs::function::main"));
     }
 }
