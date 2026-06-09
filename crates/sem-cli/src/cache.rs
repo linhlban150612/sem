@@ -117,6 +117,7 @@ impl DiskCache {
         files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        custom_test_dirs: &[String],
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
@@ -172,7 +173,7 @@ impl DiskCache {
             }
         }
 
-        let test_entity_ids = graph.filter_test_entities(entities);
+        let test_entity_ids = graph.filter_test_entities_with_custom_dirs(entities, custom_test_dirs);
         {
             let mut stmt =
                 tx.prepare("INSERT INTO entity_flags (entity_id, is_test) VALUES (?1, 1)")?;
@@ -1182,7 +1183,7 @@ mod tests {
         );
         let cache = DiskCache::open(&root).unwrap();
         cache
-            .save_topology(&root, &files, &graph, &entities)
+            .save_topology(&root, &files, &graph, &entities, &[])
             .unwrap();
 
         assert!(cache.load(&root, &files).is_none());
@@ -1636,6 +1637,7 @@ mod tests {
                 &cli_topology_to_mcp,
                 &cli_topology_to_mcp_files,
                 &empty_graph(),
+                &[],
                 &[],
             )
             .unwrap();

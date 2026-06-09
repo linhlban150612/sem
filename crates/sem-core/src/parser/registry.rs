@@ -19,6 +19,7 @@ pub struct ParserRegistry {
     plugins: Vec<Box<dyn SemanticParserPlugin>>,
     extension_map: HashMap<String, usize>, // ext → index into plugins
     custom_ext_canonical: HashMap<String, String>, // ".mypy" → ".py" (custom → canonical)
+    pub custom_test_dirs: Vec<String>,
 }
 
 impl ParserRegistry {
@@ -27,6 +28,7 @@ impl ParserRegistry {
             plugins: Vec::new(),
             extension_map: HashMap::new(),
             custom_ext_canonical: HashMap::new(),
+            custom_test_dirs: Vec::new(),
         }
     }
 
@@ -148,8 +150,18 @@ impl ParserRegistry {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some((ext, lang)) = line.split_once('=') {
-                self.add_extension_mapping(ext.trim(), lang.trim());
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+                if key == "test-dirs" {
+                    self.custom_test_dirs = value
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                } else {
+                    self.add_extension_mapping(key, value);
+                }
             }
         }
     }
@@ -884,6 +896,44 @@ mod tests {
             .get_plugin_with_content("script.py", content)
             .expect("should use Python parser");
         assert_eq!(plugin.id(), "code"); // Python uses code plugin, not PHP
+    }
+
+    #[test]
+    fn test_load_semrc_parses_test_dirs() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, ".semrc", "test-dirs = e2e-tests, smoke, qa\n");
+        let mut registry = create_default_registry();
+        registry.load_semrc(dir.path());
+        assert_eq!(registry.custom_test_dirs, vec!["e2e-tests", "smoke", "qa"]);
+    }
+
+    #[test]
+    fn test_load_semrc_test_dirs_with_extension_mappings() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, ".semrc", ".inc = php\ntest-dirs = custom-tests\n.xyz = cpp\n");
+        let mut registry = create_default_registry();
+        registry.load_semrc(dir.path());
+        assert_eq!(registry.custom_test_dirs, vec!["custom-tests"]);
+        assert!(registry.get_plugin("foo.inc").is_some());
+        assert!(registry.get_plugin("bar.xyz").is_some());
+    }
+
+    #[test]
+    fn test_load_semrc_skips_empty_test_dirs() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, ".semrc", "test-dirs = , ,  \n");
+        let mut registry = create_default_registry();
+        registry.load_semrc(dir.path());
+        assert!(registry.custom_test_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_load_semrc_no_test_dirs_leaves_empty() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, ".semrc", ".inc = php\n");
+        let mut registry = create_default_registry();
+        registry.load_semrc(dir.path());
+        assert!(registry.custom_test_dirs.is_empty());
     }
 
     #[test]

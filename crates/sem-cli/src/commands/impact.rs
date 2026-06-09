@@ -148,10 +148,10 @@ pub fn impact_command(opts: ImpactOptions) {
                         timings.mark("entity_lookup");
                         match opts.mode {
                             ImpactMode::Tests => {
-                                print_tests(&graph, entity, &all_entities, opts.json)
+                                print_tests(&graph, entity, &all_entities, opts.json, &registry.custom_test_dirs)
                             }
                             ImpactMode::All => {
-                                print_all(&graph, entity, &all_entities, opts.json, opts.depth)
+                                print_all(&graph, entity, &all_entities, opts.json, opts.depth, &registry.custom_test_dirs)
                             }
                             _ => unreachable!(),
                         }
@@ -198,9 +198,9 @@ pub fn impact_command(opts: ImpactOptions) {
                 );
                 timings.mark("entity_lookup");
                 match opts.mode {
-                    ImpactMode::Tests => print_tests(&graph, entity, &all_entities, opts.json),
+                    ImpactMode::Tests => print_tests(&graph, entity, &all_entities, opts.json, &registry.custom_test_dirs),
                     ImpactMode::All => {
-                        print_all(&graph, entity, &all_entities, opts.json, opts.depth)
+                        print_all(&graph, entity, &all_entities, opts.json, opts.depth, &registry.custom_test_dirs)
                     }
                     _ => unreachable!(),
                 }
@@ -374,8 +374,9 @@ fn print_tests(
     entity: &EntityInfo,
     all_entities: &[sem_core::model::entity::SemanticEntity],
     json: bool,
+    custom_test_dirs: &[String],
 ) {
-    let tests = graph.test_impact(&entity.id, all_entities);
+    let tests = graph.test_impact_with_custom_dirs(&entity.id, all_entities, custom_test_dirs);
     print_tests_result(entity, &tests, json);
 }
 
@@ -438,8 +439,9 @@ fn print_all(
     all_entities: &[sem_core::model::entity::SemanticEntity],
     json: bool,
     depth: usize,
+    custom_test_dirs: &[String],
 ) {
-    let tests = graph.test_impact(&entity.id, all_entities);
+    let tests = graph.test_impact_with_custom_dirs(&entity.id, all_entities, custom_test_dirs);
     print_all_with_tests(graph, entity, &tests, json, depth);
 }
 

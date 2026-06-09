@@ -799,7 +799,7 @@ impl SemServer {
 
         let output = match mode {
             "tests" => {
-                let tests = graph.test_impact(entity_id, &all_entities);
+                let tests = graph.test_impact_with_custom_dirs(entity_id, &all_entities, &self.registry.custom_test_dirs);
                 let result: Vec<serde_json::Value> = tests
                     .iter()
                     .map(|d| {
@@ -823,7 +823,7 @@ impl SemServer {
                 let deps = graph.get_dependencies(entity_id);
                 let dependents = graph.get_dependents(entity_id);
                 let impact = graph.impact_analysis(entity_id);
-                let tests = graph.test_impact(entity_id, &all_entities);
+                let tests = graph.test_impact_with_custom_dirs(entity_id, &all_entities, &self.registry.custom_test_dirs);
 
                 let map_entities =
                     |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
