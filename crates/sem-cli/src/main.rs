@@ -341,6 +341,9 @@ enum Commands {
     /// Flush spooled telemetry (internal; spawned in the background)
     #[command(name = "__telemetry-flush", hide = true)]
     TelemetryFlush,
+    /// Refresh the cached latest-version info (internal; spawned in the background)
+    #[command(name = "__update-check", hide = true)]
+    UpdateCheck,
 }
 
 /// Command name recorded in anonymous usage telemetry. Names only — no
@@ -364,7 +367,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Whoami) => "whoami",
         Some(Commands::Update) => "update",
         Some(Commands::Completions { .. }) => "completions",
-        Some(Commands::TelemetryFlush) => return None,
+        Some(Commands::TelemetryFlush) | Some(Commands::UpdateCheck) => return None,
         None => "diff",
     })
 }
@@ -399,6 +402,7 @@ fn main() {
 
     if let Some(name) = telemetry_command_name(&cli.command) {
         telemetry::record(name);
+        commands::update::maybe_notify(name);
     }
 
     match cli.command {
@@ -659,6 +663,9 @@ fn main() {
         }
         Some(Commands::TelemetryFlush) => {
             telemetry::flush();
+        }
+        Some(Commands::UpdateCheck) => {
+            commands::update::background_check();
         }
         None => {
             // Default to diff when no subcommand is given

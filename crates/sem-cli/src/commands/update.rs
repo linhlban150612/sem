@@ -1,4 +1,5 @@
-//! `sem update` — self-update to the latest GitHub release.
+//! `sem update` — self-update to the latest GitHub release, plus a
+//! non-blocking background check that nudges the user when behind.
 
 use std::fs;
 use std::io::Read;
@@ -6,11 +7,149 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 
 const REPO: &str = "Ataraxy-Labs/sem";
 const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 /// Release binaries are ~15MB; refuse anything wildly larger.
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+/// How often the background version check runs, and how often the
+/// "new version available" hint may print.
+const CHECK_INTERVAL_SECS: u64 = 24 * 3600;
+const NOTIFY_INTERVAL_SECS: u64 = 24 * 3600;
+const CHECK_TIMEOUT_SECS: u64 = 5;
+
+// ─── Update notification ─────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default)]
+struct UpdateCheckState {
+    #[serde(default)]
+    latest_version: String,
+    #[serde(default)]
+    last_check: u64,
+    #[serde(default)]
+    last_notified: u64,
+}
+
+fn check_disabled() -> bool {
+    let set = |var: &str| std::env::var(var).is_ok_and(|v| !v.is_empty() && v != "0");
+    set("SEM_NO_UPDATE_CHECK") || set("DO_NOT_TRACK")
+}
+
+fn check_state_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".sem").join("update-check.json"))
+}
+
+fn load_check_state() -> UpdateCheckState {
+    check_state_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_check_state(state: &UpdateCheckState) {
+    let Some(path) = check_state_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, serde_json::to_string(state).unwrap_or_default());
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Print a once-a-day hint when a newer release is known, and kick off a
+/// detached background check when the cached answer is stale. Costs one
+/// small file read; never touches the network in this process.
+pub fn maybe_notify(command: &str) {
+    if check_disabled() {
+        return;
+    }
+    // Commands where an extra stderr line is unwanted noise.
+    if matches!(command, "update" | "mcp" | "completions") {
+        return;
+    }
+
+    let mut state = load_check_state();
+    let now = now_secs();
+    let mut dirty = false;
+
+    if !state.latest_version.is_empty()
+        && is_newer(&state.latest_version, env!("CARGO_PKG_VERSION"))
+        && now.saturating_sub(state.last_notified) >= NOTIFY_INTERVAL_SECS
+    {
+        eprintln!(
+            "{}",
+            format!(
+                "A new version of sem is available: v{} → v{}. Run `sem update` to upgrade.",
+                env!("CARGO_PKG_VERSION"),
+                state.latest_version
+            )
+            .dimmed()
+        );
+        state.last_notified = now;
+        dirty = true;
+    }
+
+    if now.saturating_sub(state.last_check) >= CHECK_INTERVAL_SECS {
+        // Stamp before spawning so concurrent runs don't spawn a checker each.
+        state.last_check = now;
+        dirty = true;
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .arg("__update-check")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+
+    if dirty {
+        save_check_state(&state);
+    }
+}
+
+/// Hidden subcommand body: fetch the latest release tag and cache it.
+/// Runs in its own process.
+pub fn background_check() {
+    if check_disabled() {
+        return;
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(CHECK_TIMEOUT_SECS))
+        .build();
+    let Ok(resp) = agent
+        .get(&format!(
+            "https://api.github.com/repos/{REPO}/releases/latest"
+        ))
+        .set("User-Agent", "sem-cli")
+        .set("Accept", "application/vnd.github+json")
+        .call()
+    else {
+        return;
+    };
+    let Ok(release) = resp.into_json::<serde_json::Value>() else {
+        return;
+    };
+    let Some(tag) = release["tag_name"].as_str() else {
+        return;
+    };
+
+    let mut state = load_check_state();
+    state.latest_version = tag.trim_start_matches('v').to_string();
+    state.last_check = now_secs();
+    save_check_state(&state);
+}
+
+// ─── sem update ──────────────────────────────────────────────────────────
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let current = env!("CARGO_PKG_VERSION");
