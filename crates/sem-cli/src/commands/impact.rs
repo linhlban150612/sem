@@ -28,6 +28,24 @@ pub enum ImpactMode {
 
 const LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD: usize = 20_000;
 
+/// Run a graph build behind a uv-style spinner, then clear it and print a
+/// summary before the result is used (so the spinner never interleaves with
+/// command output). `count` extracts the entity count for the summary line.
+fn build_with_spinner<T>(
+    file_count: usize,
+    build: impl FnOnce() -> T,
+    count: impl FnOnce(&T) -> usize,
+) -> T {
+    let prog = crate::progress::Progress::start("Building entity graph");
+    let result = build();
+    prog.done(&format!(
+        "{} entities, {} files",
+        super::graph::fmt_count(count(&result)),
+        super::graph::fmt_count(file_count)
+    ));
+    result
+}
+
 pub fn impact_command(opts: ImpactOptions) {
     if super::cloud::try_cloud_impact(&opts).is_some() {
         return;
@@ -57,42 +75,47 @@ pub fn impact_command(opts: ImpactOptions) {
 
     match opts.mode {
         ImpactMode::Deps => {
-            let graph =
-                if opts.no_cache || file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
-                    let entity_name = opts.entity_name.clone();
-                    let entity_id = opts.entity_id.clone();
-                    let file_hint_for_match = file_hint.clone();
-                    super::graph::get_or_build_direct_dependency_graph_with_timings(
-                        root,
-                        &file_paths,
-                        &registry,
-                        opts.no_cache,
-                        &mut timings,
-                        move |entity| {
-                            if let Some(id) = entity_id.as_deref() {
-                                return entity.id == id;
-                            }
-                            let Some(name) = entity_name.as_deref() else {
-                                return false;
-                            };
-                            if file_hint_for_match
-                                .as_deref()
-                                .is_some_and(|file| entity.file_path != file)
-                            {
-                                return false;
-                            }
-                            super::entity_matches_query(entity, name)
-                        },
-                    )
-                } else {
-                    super::graph::get_or_build_graph_topology_with_timings(
-                        root,
-                        &file_paths,
-                        &registry,
-                        opts.no_cache,
-                        &mut timings,
-                    )
-                };
+            let graph = build_with_spinner(
+                file_paths.len(),
+                || {
+                    if opts.no_cache || file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
+                        let entity_name = opts.entity_name.clone();
+                        let entity_id = opts.entity_id.clone();
+                        let file_hint_for_match = file_hint.clone();
+                        super::graph::get_or_build_direct_dependency_graph_with_timings(
+                            root,
+                            &file_paths,
+                            &registry,
+                            opts.no_cache,
+                            &mut timings,
+                            move |entity| {
+                                if let Some(id) = entity_id.as_deref() {
+                                    return entity.id == id;
+                                }
+                                let Some(name) = entity_name.as_deref() else {
+                                    return false;
+                                };
+                                if file_hint_for_match
+                                    .as_deref()
+                                    .is_some_and(|file| entity.file_path != file)
+                                {
+                                    return false;
+                                }
+                                super::entity_matches_query(entity, name)
+                            },
+                        )
+                    } else {
+                        super::graph::get_or_build_graph_topology_with_timings(
+                            root,
+                            &file_paths,
+                            &registry,
+                            opts.no_cache,
+                            &mut timings,
+                        )
+                    }
+                },
+                |g| g.entities.len(),
+            );
             let entity = find_entity(
                 &graph,
                 opts.entity_name.as_deref(),
@@ -104,23 +127,29 @@ pub fn impact_command(opts: ImpactOptions) {
             timings.mark("cli_output_serialization");
         }
         ImpactMode::Dependents => {
-            let graph = if file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
-                super::graph::get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
-                    root,
-                    &file_paths,
-                    &registry,
-                    opts.no_cache,
-                    &mut timings,
-                )
-            } else {
-                super::graph::get_or_build_graph_topology_with_timings(
-                    root,
-                    &file_paths,
-                    &registry,
-                    opts.no_cache,
-                    &mut timings,
-                )
-            };
+            let graph = build_with_spinner(
+                file_paths.len(),
+                || {
+                    if file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
+                        super::graph::get_or_build_graph_topology_with_topology_save_on_miss_with_timings(
+                            root,
+                            &file_paths,
+                            &registry,
+                            opts.no_cache,
+                            &mut timings,
+                        )
+                    } else {
+                        super::graph::get_or_build_graph_topology_with_timings(
+                            root,
+                            &file_paths,
+                            &registry,
+                            opts.no_cache,
+                            &mut timings,
+                        )
+                    }
+                },
+                |g| g.entities.len(),
+            );
             let entity = find_entity(
                 &graph,
                 opts.entity_name.as_deref(),
@@ -133,13 +162,23 @@ pub fn impact_command(opts: ImpactOptions) {
         }
         ImpactMode::Tests | ImpactMode::All => {
             if file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
-                let graph_data =
-                    super::graph::get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
-                    root,
-                    &file_paths,
-                    &registry,
-                    opts.no_cache,
-                    &mut timings,
+                let graph_data = build_with_spinner(
+                    file_paths.len(),
+                    || {
+                        super::graph::get_or_build_graph_with_test_data_and_topology_save_on_miss_with_timings(
+                            root,
+                            &file_paths,
+                            &registry,
+                            opts.no_cache,
+                            &mut timings,
+                        )
+                    },
+                    |gd| match gd {
+                        super::graph::GraphWithTestData::Full(g, _) => g.entities.len(),
+                        super::graph::GraphWithTestData::Topology { graph, .. } => {
+                            graph.entities.len()
+                        }
+                    },
                 );
                 match graph_data {
                     super::graph::GraphWithTestData::Full(graph, all_entities) => {
@@ -187,12 +226,18 @@ pub fn impact_command(opts: ImpactOptions) {
                     }
                 }
             } else {
-                let (graph, all_entities) = super::graph::get_or_build_graph_with_timings(
-                    root,
-                    &file_paths,
-                    &registry,
-                    opts.no_cache,
-                    &mut timings,
+                let (graph, all_entities) = build_with_spinner(
+                    file_paths.len(),
+                    || {
+                        super::graph::get_or_build_graph_with_timings(
+                            root,
+                            &file_paths,
+                            &registry,
+                            opts.no_cache,
+                            &mut timings,
+                        )
+                    },
+                    |(g, _)| g.entities.len(),
                 );
                 let entity = find_entity(
                     &graph,
