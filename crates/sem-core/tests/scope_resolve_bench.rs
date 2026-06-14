@@ -2022,3 +2022,51 @@ fn scope_resolve_kotlin() {
     let fp = get_kotlin_false_positive_edges();
     run_scope_resolve_for_lang("kotlin", &expected, &fp);
 }
+
+#[test]
+fn rust_super_module_qualified_call_resolves() {
+    // Regression: `super::module::func()` calls were dropped because the
+    // resolver kept the `super::` prefix in the path and never matched the
+    // real module, so impact under-reported the blast radius.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("commands")).unwrap();
+    std::fs::write(
+        root.join("commands/graph.rs"),
+        "pub fn build_graph() -> i32 {\n    42\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("commands/context.rs"),
+        "pub fn context_command() -> i32 {\n    super::graph::build_graph()\n}\n",
+    )
+    .unwrap();
+    init_git(root);
+
+    let registry = create_default_registry();
+    let files = vec![
+        "commands/graph.rs".to_string(),
+        "commands/context.rs".to_string(),
+    ];
+    let (graph, _) = EntityGraph::build(root, &files, &registry);
+
+    let id = |name: &str| {
+        graph
+            .entities
+            .values()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("missing entity {name}"))
+            .id
+            .clone()
+    };
+    let caller = id("context_command");
+    let callee = id("build_graph");
+
+    assert!(
+        graph.edges.iter().any(|e| {
+            e.from_entity == caller && e.to_entity == callee && e.ref_type == RefType::Calls
+        }),
+        "context_command should call super::graph::build_graph; edges: {:?}",
+        graph.edges
+    );
+}

@@ -48,6 +48,8 @@ impl Progress {
     }
 
     /// Update the spinner's message as the work moves through phases.
+    /// Reserved for upcoming per-phase messages (Scanning → Parsing → ...).
+    #[allow(dead_code)]
     pub fn set(&self, message: &str) {
         if let Some(bar) = &self.bar {
             bar.set_message(message.to_string());
@@ -73,6 +75,7 @@ impl Progress {
     }
 
     /// Clear the spinner with no summary (e.g. an error path took over).
+    #[allow(dead_code)]
     pub fn clear(self) {
         if let Some(bar) = self.bar {
             bar.finish_and_clear();

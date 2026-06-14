@@ -5279,56 +5279,70 @@ fn extract_call_ref(
     // Scoped call nodes (e.g. Rust "scoped_identifier" for Type::method)
     if config.scoped_call_nodes.contains(&func_kind) {
         let text = func.utf8_text(source).unwrap_or("");
-        let parts: Vec<&str> = text.split("::").collect();
-        if parts.len() >= 2 {
-            // Handle super:: and self:: prefixed paths by emitting a call
-            // to the final name so scope chain resolution can find it.
-            let is_path_prefix = parts[0] == "super" || parts[0] == "self" || parts[0] == "crate";
-            let method_name = parts[parts.len() - 1];
-            if is_path_prefix && parts.len() == 2 {
-                if !method_name.is_empty() && !is_builtin(method_name, config) {
+        let mut parts: Vec<&str> = text.split("::").collect();
+        // Strip Rust path-prefix segments (super::/self::/crate::) so the
+        // remainder resolves against real modules/types. Without this,
+        // `super::graph::foo` keeps the prefix in the path and never matches
+        // the real `graph` module, so the call edge is silently dropped.
+        let had_path_prefix = matches!(parts.first(), Some(&("super" | "self" | "crate")));
+        while parts.len() > 1 && matches!(parts[0], "super" | "self" | "crate") {
+            parts.remove(0);
+        }
+        let method_name = parts.last().copied().unwrap_or("");
+        if !method_name.is_empty() && !is_builtin(method_name, config) {
+            let emit_call = |refs: &mut Vec<AstRef>| {
+                refs.push(AstRef {
+                    kind: AstRefKind::Call {
+                        name: method_name.to_string(),
+                        argument_labels: None,
+                    },
+                    row,
+                    start_byte: ref_node.start_byte(),
+                    end_byte: ref_node.end_byte(),
+                });
+            };
+
+            if parts.len() == 1 {
+                // After stripping a path prefix (`super::foo` -> `foo`), resolve
+                // the bare name through the scope chain.
+                if had_path_prefix {
+                    emit_call(refs);
+                }
+            } else {
+                let receiver = parts[..parts.len() - 1].join("::");
+                let receiver_base = parts[parts.len() - 2];
+                let receiver_is_type = receiver_base
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_uppercase());
+                if had_path_prefix && !receiver_is_type {
+                    // A path-prefixed module call (`super::graph::foo`) would
+                    // become a lowercase-module ScopedCall, which the resolver
+                    // can't link. Emit a plain Call to the final name so
+                    // scope/global name resolution finds the entity.
+                    emit_call(refs);
+                } else if parts.len() == 2 && receiver_is_type && !is_builtin(receiver_base, config)
+                {
                     refs.push(AstRef {
-                        kind: AstRefKind::Call {
-                            name: method_name.to_string(),
+                        kind: AstRefKind::MethodCall {
+                            receiver: receiver_base.to_string(),
+                            method: method_name.to_string(),
                             argument_labels: None,
                         },
                         row,
                         start_byte: ref_node.start_byte(),
                         end_byte: ref_node.end_byte(),
                     });
-                }
-            } else {
-                let receiver = parts[..parts.len() - 1].join("::");
-                let receiver_base = parts[parts.len() - 2];
-                if !receiver.is_empty() && !method_name.is_empty() {
-                    if parts.len() == 2
-                        && receiver_base
-                            .chars()
-                            .next()
-                            .map_or(false, |c| c.is_uppercase())
-                        && !is_builtin(receiver_base, config)
-                    {
-                        refs.push(AstRef {
-                            kind: AstRefKind::MethodCall {
-                                receiver: receiver_base.to_string(),
-                                method: method_name.to_string(),
-                                argument_labels: None,
-                            },
-                            row,
-                            start_byte: ref_node.start_byte(),
-                            end_byte: ref_node.end_byte(),
-                        });
-                    } else if !is_builtin(method_name, config) {
-                        refs.push(AstRef {
-                            kind: AstRefKind::ScopedCall {
-                                path: receiver,
-                                name: method_name.to_string(),
-                            },
-                            row,
-                            start_byte: ref_node.start_byte(),
-                            end_byte: ref_node.end_byte(),
-                        });
-                    }
+                } else {
+                    refs.push(AstRef {
+                        kind: AstRefKind::ScopedCall {
+                            path: receiver,
+                            name: method_name.to_string(),
+                        },
+                        row,
+                        start_byte: ref_node.start_byte(),
+                        end_byte: ref_node.end_byte(),
+                    });
                 }
             }
         }
