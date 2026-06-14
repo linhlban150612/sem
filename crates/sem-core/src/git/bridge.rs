@@ -153,6 +153,66 @@ impl GitBridge {
         Ok(files)
     }
 
+    /// True when this repo uses a sparse checkout. libgit2 cannot read a
+    /// sparse index (`unsupported mandatory extension: 'sdir'`), and even when
+    /// the index is readable, its workdir diff reports sparse-excluded files as
+    /// deleted. In both cases we route working/staged diffs through the git CLI,
+    /// which understands sparse checkouts correctly.
+    fn is_sparse_checkout(&self) -> bool {
+        self.repo
+            .config()
+            .and_then(|cfg| cfg.get_bool("core.sparseCheckout"))
+            .unwrap_or(false)
+    }
+
+    /// Get working-tree or staged changed files via the git CLI. Used for
+    /// sparse checkouts where libgit2's index/workdir diff is unusable.
+    /// Rename detection (-M) is on; contents are populated by the caller.
+    ///
+    /// `staged` selects `--cached` (HEAD vs index). Otherwise we diff against
+    /// HEAD (not the bare worktree-vs-index `git diff`) to match sem's Working
+    /// scope, which shows the full current state including staged changes.
+    fn changed_files_via_cli(
+        &self,
+        staged: bool,
+        pathspecs: &[String],
+    ) -> Result<Vec<FileChange>, GitError> {
+        let has_head = self.repo.head().is_ok();
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&self.repo_root)
+            .arg("diff")
+            .arg("--name-status")
+            .arg("-M")
+            .arg("-z");
+        if staged {
+            command.arg("--cached");
+        } else if has_head {
+            // Full working state since HEAD (includes staged), matching the
+            // libgit2 diff_tree_to_workdir_with_index path.
+            command.arg("HEAD");
+        }
+        if !pathspecs.is_empty() {
+            command.arg("--");
+            for spec in self.normalize_pathspecs(pathspecs)? {
+                command.arg(spec);
+            }
+        }
+
+        let output = command.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(git_command_error(if stderr.is_empty() {
+                format!("git diff exited with {}", output.status)
+            } else {
+                stderr
+            }));
+        }
+
+        Ok(parse_name_status_z(&output.stdout))
+    }
+
     pub fn get_staged_files_with_base_ref(
         &self,
         base: &str,
@@ -235,6 +295,10 @@ impl GitBridge {
     }
 
     fn get_staged_diff_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
+        if self.is_sparse_checkout() {
+            return self.changed_files_via_cli(true, pathspecs);
+        }
+
         let head_tree = match self.repo.head() {
             Ok(head) => {
                 let commit = head.peel_to_commit()?;
@@ -272,6 +336,12 @@ impl GitBridge {
     }
 
     fn get_working_diff_files(&self, pathspecs: &[String]) -> Result<Vec<FileChange>, GitError> {
+        if self.is_sparse_checkout() {
+            // Sparse index is unreadable by libgit2, and its workdir diff would
+            // mark sparse-excluded files as deleted. Ask git directly.
+            return self.changed_files_via_cli(false, pathspecs);
+        }
+
         let mut opts = self.make_diff_opts(pathspecs)?;
         opts.include_untracked(false);
 
@@ -654,7 +724,10 @@ impl GitBridge {
     }
 
     fn read_index_file(&self, file_path: &str) -> Option<String> {
-        let index = self.repo.index().ok()?;
+        // libgit2 cannot open a sparse index; fall back to the git CLI.
+        let Ok(index) = self.repo.index() else {
+            return self.read_index_file_cli(file_path);
+        };
         let entry = index.get_path(Path::new(file_path), 0)?;
         let blob = self.repo.find_blob(entry.id).ok()?;
         let bytes = blob.content();
@@ -664,6 +737,24 @@ impl GitBridge {
         std::str::from_utf8(bytes)
             .ok()
             .map(|s| Self::normalize_line_endings(s.to_string()))
+    }
+
+    /// Read a file's staged (index) content via `git show :path`. Used when
+    /// libgit2 cannot open the index (sparse checkouts).
+    fn read_index_file_cli(&self, file_path: &str) -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .arg("show")
+            .arg(format!(":{file_path}"))
+            .output()
+            .ok()?;
+        if !output.status.success() || Self::bytes_look_binary(&output.stdout, true) {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(Self::normalize_line_endings)
     }
 
 
@@ -974,6 +1065,59 @@ impl GitBridge {
 
         Ok(commits)
     }
+}
+
+/// Parse `git diff --name-status -M -z` output into FileChange entries.
+/// Records are NUL-delimited; a rename/copy is a status token (R100/C75)
+/// followed by old path then new path, others are status then one path.
+fn parse_name_status_z(stdout: &[u8]) -> Vec<FileChange> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut fields = text.split('\0').filter(|s| !s.is_empty());
+    let mut files = Vec::new();
+
+    while let Some(status) = fields.next() {
+        let code = status.chars().next().unwrap_or(' ');
+        let (file_change, _) = match code {
+            'R' | 'C' => {
+                let Some(old_path) = fields.next() else { break };
+                let Some(new_path) = fields.next() else { break };
+                (
+                    FileChange {
+                        file_path: new_path.to_string(),
+                        status: FileStatus::Renamed,
+                        old_file_path: Some(old_path.to_string()),
+                        before_content: None,
+                        after_content: None,
+                    },
+                    (),
+                )
+            }
+            'A' | 'D' | 'M' | 'T' => {
+                let Some(path) = fields.next() else { break };
+                let status = match code {
+                    'A' => FileStatus::Added,
+                    'D' => FileStatus::Deleted,
+                    _ => FileStatus::Modified,
+                };
+                (
+                    FileChange {
+                        file_path: path.to_string(),
+                        status,
+                        old_file_path: None,
+                        before_content: None,
+                        after_content: None,
+                    },
+                    (),
+                )
+            }
+            _ => continue,
+        };
+        if !file_change.file_path.starts_with(".sem/") {
+            files.push(file_change);
+        }
+    }
+
+    files
 }
 
 fn parse_blame_porcelain(output: &str) -> Vec<BlameLineInfo> {
@@ -1302,6 +1446,46 @@ mod tests {
         assert!(blame[0].commit_sha.is_some());
         assert_eq!(blame[1].commit_sha, None);
         assert_eq!(blame[1].author, "Not Committed Yet");
+    }
+
+    #[test]
+    fn sparse_checkout_does_not_report_excluded_files_as_deleted() {
+        // Regression for #330: with a cone-mode sparse checkout, libgit2's
+        // workdir diff sees sparse-excluded files as absent and reports them
+        // deleted (and a true sparse index errors outright). We route through
+        // the git CLI, which understands sparse checkouts.
+        let temp = TempDir::new().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        fs::create_dir_all(temp.path().join("keep")).unwrap();
+        fs::create_dir_all(temp.path().join("drop")).unwrap();
+        commit_file(&repo, "keep/a.rs", "fn kept() { let x = 1; }\n", "init keep");
+        commit_file(&repo, "drop/b.rs", "fn dropped() {}\n", "init drop");
+
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        // Enable cone-mode sparse checkout restricted to keep/.
+        if !git(&["sparse-checkout", "init", "--cone"]).status.success() {
+            return; // git too old for sparse-checkout; skip
+        }
+        git(&["sparse-checkout", "set", "keep"]);
+        // Modify a file inside the cone.
+        fs::write(temp.path().join("keep/a.rs"), "fn kept() { let x = 2; }\n").unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let files = bridge.get_changed_files(&DiffScope::Working, &[]).unwrap();
+
+        // Only the in-cone modification; the sparse-excluded drop/b.rs must
+        // NOT appear as deleted.
+        assert_eq!(files.len(), 1, "got: {files:?}");
+        assert_eq!(files[0].file_path, "keep/a.rs");
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert!(!files.iter().any(|f| f.file_path == "drop/b.rs"));
     }
 
     #[test]
