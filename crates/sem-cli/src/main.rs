@@ -19,7 +19,6 @@ use commands::entities::{entities_command, EntitiesOptions};
 use commands::graph::{graph_command, GraphOptions};
 use commands::impact::{impact_command, ImpactMode, ImpactOptions};
 use commands::log::{log_command, LogOptions};
-use commands::verify::{verify_command, VerifyOptions};
 
 #[derive(Parser)]
 #[command(name = "sem", version = env!("CARGO_PKG_VERSION"), about = "Semantic version control")]
@@ -283,32 +282,6 @@ enum Commands {
         #[arg(long)]
         no_default_excludes: bool,
     },
-    /// Verify function call arity across the codebase
-    Verify {
-        /// Output format
-        #[arg(long, value_parser = ["terminal", "json"])]
-        format: Option<String>,
-
-        /// Output as JSON (shorthand for --format json)
-        #[arg(long)]
-        json: bool,
-
-        /// Compare working tree vs HEAD, find broken callers from signature changes
-        #[arg(long)]
-        diff: bool,
-
-        /// Only include files with these extensions (e.g. --file-exts .py .rs)
-        #[arg(long, num_args = 1..)]
-        file_exts: Vec<String>,
-
-        /// Skip the SQLite entity cache (rebuild from scratch)
-        #[arg(long)]
-        no_cache: bool,
-
-        /// Include directories and generated files that are excluded by default
-        #[arg(long)]
-        no_default_excludes: bool,
-    },
     /// Show lifetime diff statistics
     Stats,
     /// Start the MCP server (stdin/stdout transport)
@@ -357,7 +330,6 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Log { .. }) => "log",
         Some(Commands::Entities { .. }) => "entities",
         Some(Commands::Context { .. }) => "context",
-        Some(Commands::Verify { .. }) => "verify",
         Some(Commands::Stats) => "stats",
         Some(Commands::Mcp) => "mcp",
         Some(Commands::Setup) => "setup",
@@ -587,26 +559,6 @@ fn main() {
                 file_path: file,
                 budget,
                 json: resolve_json(format, json),
-                file_exts,
-                no_cache,
-                no_default_excludes,
-            });
-        }
-        Some(Commands::Verify {
-            format,
-            json,
-            diff,
-            file_exts,
-            no_cache,
-            no_default_excludes,
-        }) => {
-            verify_command(VerifyOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                json: resolve_json(format, json),
-                diff,
                 file_exts,
                 no_cache,
                 no_default_excludes,

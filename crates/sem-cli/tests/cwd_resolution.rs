@@ -86,29 +86,6 @@ fn commit_sub_file(repo: &TempRepo) {
 }
 
 #[test]
-fn verify_diff_finds_broken_callers_from_subdirectory() {
-    let repo = TempRepo::new();
-    write_sub_file(
-        &repo,
-        "def f(x, y):\n    return x + y\n\ndef g():\n    return f(1, 2)\n",
-    );
-    commit_sub_file(&repo);
-    write_sub_file(
-        &repo,
-        "def f(x):\n    return x\n\ndef g():\n    return f(1, 2)\n",
-    );
-
-    let output = run_sem(&["verify", "--diff", "--json"], &[], &repo.subdir());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert_eq!(output.status.code(), Some(1), "{stdout}");
-    let mismatches: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    assert_eq!(mismatches[0]["callee"], "f");
-    assert_eq!(mismatches[0]["caller"], "g");
-    assert_eq!(mismatches[0]["file"], "sub/foo.py");
-}
-
-#[test]
 fn diff_patch_reads_worktree_contents_from_repo_root() {
     let repo = TempRepo::new();
     write_sub_file(&repo, "def foo():\n    return 1\n");

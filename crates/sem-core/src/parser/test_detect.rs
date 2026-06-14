@@ -1,8 +1,8 @@
 //! Shared test-path detection logic.
 //!
 //! Single source of truth for deciding whether a file path belongs to a
-//! test/fixture/benchmark directory. Used by both `graph.rs` (test-entity
-//! filtering) and `verify.rs` (arity-check exclusions).
+//! test/fixture/benchmark directory. Used by `graph.rs` for test-entity
+//! filtering.
 
 /// Token-level matches: directory name is split on `-`, `_`, `.` and
 /// any resulting token that equals one of these triggers a match.
