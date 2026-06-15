@@ -774,6 +774,12 @@ fn resolve_with_scopes_full_inner(
     let entity_ranges = &lookups.entity_ranges;
     let go_pkg_index = &lookups.go_pkg_index;
 
+    // Index of method names that are defined by exactly one class in the whole
+    // graph. Used as a last-resort fallback for `receiver.method()` calls whose
+    // receiver type can't be inferred (e.g. a local of a type defined in another
+    // file/crate). Ambiguous names are omitted, so resolution stays precise.
+    let unique_method_targets = build_unique_method_targets(class_members);
+
     // Build file-path indexed entity lookup: file_path -> Vec<&SemanticEntity>
     let mut entities_by_file: HashMap<&str, Vec<&SemanticEntity>> = HashMap::default();
     for entity in all_entities {
@@ -1189,6 +1195,7 @@ fn resolve_with_scopes_full_inner(
                                     &instance_attr_types,
                                     entity_map,
                                     &swift_call_signatures,
+                                    &unique_method_targets,
                                     file_path,
                                     &entity.id,
                                     allow_cross_file,
@@ -1211,6 +1218,7 @@ fn resolve_with_scopes_full_inner(
                                 &instance_attr_types,
                                 entity_map,
                                 &swift_call_signatures,
+                                &unique_method_targets,
                                 file_path,
                                 &entity.id,
                                 allow_cross_file,
@@ -5553,6 +5561,34 @@ fn push_method_call_ref(
 }
 
 /// Resolve a single reference against scopes and symbol tables.
+/// Build an index of method names that are defined by exactly one class in the
+/// whole graph: `method_name -> the single defining method id`. Names defined by
+/// more than one class are omitted (ambiguous), so a lookup hit is a confident
+/// target. Used by the name-based `receiver.method()` fallback in `resolve_ref`.
+fn build_unique_method_targets(
+    class_members: &HashMap<String, Vec<(String, String)>>,
+) -> HashMap<&str, &str> {
+    // None marks a name that has been seen with more than one distinct id.
+    let mut seen: HashMap<&str, Option<&str>> = HashMap::default();
+    for members in class_members.values() {
+        for (name, id) in members {
+            match seen.get_mut(name.as_str()) {
+                None => {
+                    seen.insert(name.as_str(), Some(id.as_str()));
+                }
+                Some(slot) => {
+                    if matches!(*slot, Some(existing) if existing != id.as_str()) {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+    }
+    seen.into_iter()
+        .filter_map(|(name, id)| id.map(|id| (name, id)))
+        .collect()
+}
+
 fn resolve_ref(
     ast_ref: &AstRef,
     scope_idx: usize,
@@ -5564,6 +5600,7 @@ fn resolve_ref(
     instance_attr_types: &HashMap<(String, String), String>,
     entity_map: &HashMap<String, EntityInfo>,
     swift_call_signatures: &HashMap<String, SwiftCallSignature>,
+    unique_method_targets: &HashMap<&str, &str>,
     file_path: &str,
     from_entity_id: &str,
     allow_cross_file_calls: bool,
@@ -5996,6 +6033,29 @@ fn resolve_ref(
             if file_path.ends_with(".go") {
                 if let Some(target_id) = import_table_by_name.get(method.as_str()) {
                     return Some(((*target_id).to_string(), RefType::Calls, "import"));
+                }
+            }
+
+            // Last resort: the receiver's type couldn't be inferred (e.g. a local
+            // of a type defined in another file/crate, like `let g = build();
+            // g.method()`). If exactly one class in the graph defines a method
+            // with this name, link to it. Ambiguous names were omitted from the
+            // index, so common names like `get`/`new` never hit.
+            //
+            // Only for genuinely opaque receivers. If the receiver is a known
+            // class/import name (e.g. a parameter shadowing a class) or a
+            // declared instance attribute of the enclosing class, the precise
+            // paths above already handled it or deliberately declined, and
+            // guessing by name would create a false edge.
+            let receiver_is_known = class_members.contains_key(receiver)
+                || import_table_by_name.contains_key(receiver)
+                || find_enclosing_class_cached(scope_idx, scopes, entity_map, lookup_cache)
+                    .map_or(false, |cls| {
+                        instance_attr_types.contains_key(&(cls, receiver.to_string()))
+                    });
+            if !receiver_is_known {
+                if let Some(target_id) = unique_method_targets.get(method.as_str()) {
+                    return Some(((*target_id).to_string(), RefType::Calls, "method_name"));
                 }
             }
 
