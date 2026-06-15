@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 
 use crate::cache;
 use crate::tools::*;
+use crate::watch::{watch_enabled, RepoWatcher};
 
 const MCP_INSTRUCTIONS: &str = "sem MCP server for entity-level semantic code intelligence. \
                                 6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context.";
@@ -65,6 +66,34 @@ struct CachedTopology {
     graph: Arc<EntityGraph>,
 }
 
+/// Live-watch bookkeeping for whole-repo graph queries. Lets `sem_impact` and
+/// `sem_context` serve a hot cached graph without re-walking + re-stat-ing the
+/// tree when nothing has changed since the last build.
+struct WatchSlot {
+    /// The OS file watcher. `None` until first use; stays `None` if disabled.
+    watcher: Option<RepoWatcher>,
+    /// False once we've decided not to watch (disabled or failed to start).
+    enabled: bool,
+    /// Whether the in-memory graph has been built at least once.
+    built_once: bool,
+    /// Change generation captured at the last build.
+    last_built_generation: u64,
+    /// Current whole-repo source file list (input to the graph build).
+    file_paths: Vec<String>,
+}
+
+impl Default for WatchSlot {
+    fn default() -> Self {
+        Self {
+            watcher: None,
+            enabled: true,
+            built_once: false,
+            last_built_generation: 0,
+            file_paths: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SemServer {
     context: Arc<Mutex<Option<RepoContext>>>,
@@ -72,6 +101,7 @@ pub struct SemServer {
     entity_cache: Arc<Mutex<EntityCache>>,
     graph_cache: Arc<Mutex<Option<CachedGraph>>>,
     topology_cache: Arc<Mutex<Option<CachedTopology>>>,
+    watch: Arc<Mutex<WatchSlot>>,
     _tool_router: ToolRouter<Self>,
 }
 
@@ -472,6 +502,96 @@ impl SemServer {
         let (graph, _) = self.get_or_build_graph(repo_root, file_paths).await;
         graph
     }
+
+    /// Ensure the in-memory whole-repo caches are fresh with respect to the file
+    /// watcher, returning the current source file list. On the fast path
+    /// (nothing changed since the last build) this avoids re-walking and
+    /// re-stat-ing the tree entirely. Returns `None` when watching is disabled
+    /// or unavailable, in which case the caller uses the stat-based path.
+    async fn ensure_live(&self, repo_root: &Path) -> Option<Vec<String>> {
+        if !watch_enabled() {
+            return None;
+        }
+
+        let mut slot = self.watch.lock().await;
+
+        // Lazily start the watcher for this repo on first use.
+        if slot.watcher.is_none() {
+            if !slot.enabled {
+                return None;
+            }
+            match RepoWatcher::start(repo_root) {
+                Ok(w) => slot.watcher = Some(w),
+                Err(_) => {
+                    slot.enabled = false;
+                    return None;
+                }
+            }
+        }
+
+        let drained = slot.watcher.as_ref().unwrap().drain();
+
+        // Fast path: nothing has changed since the last build, so the cached
+        // graph is still valid. No walk, no stat storm.
+        let clean = slot.built_once
+            && drained.generation == slot.last_built_generation
+            && !slot.file_paths.is_empty();
+        if clean {
+            return Some(slot.file_paths.clone());
+        }
+
+        // Something changed (or first build). Refresh the file list only when
+        // the set of files may have changed; content-only edits reuse it.
+        if slot.file_paths.is_empty() || drained.needs_rewalk {
+            match Self::find_supported_files(repo_root, &self.registry) {
+                Ok(files) => slot.file_paths = files,
+                Err(_) => return None,
+            }
+        }
+        let file_paths = slot.file_paths.clone();
+
+        // Rebuild (incrementally, via the disk cache) and repopulate the memory
+        // caches that live_graph / live_topology read from.
+        let _ = self.get_or_build_graph(repo_root, &file_paths).await;
+        slot.last_built_generation = drained.generation;
+        slot.built_once = true;
+        Some(file_paths)
+    }
+
+    /// Whole-repo (graph, entities), kept hot by the file watcher when active.
+    async fn live_graph(
+        &self,
+        repo_root: &Path,
+    ) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
+        if self.ensure_live(repo_root).await.is_some() {
+            let guard = self.graph_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                return (cached.graph.clone(), cached.entities.clone());
+            }
+        }
+        let file_paths = Self::find_supported_files(repo_root, &self.registry).unwrap_or_default();
+        self.get_or_build_graph(repo_root, &file_paths).await
+    }
+
+    /// Whole-repo graph topology, kept hot by the file watcher when active.
+    async fn live_topology(&self, repo_root: &Path) -> Arc<EntityGraph> {
+        if self.ensure_live(repo_root).await.is_some() {
+            {
+                let guard = self.graph_cache.lock().await;
+                if let Some(ref cached) = *guard {
+                    return cached.graph.clone();
+                }
+            }
+            {
+                let guard = self.topology_cache.lock().await;
+                if let Some(ref cached) = *guard {
+                    return cached.graph.clone();
+                }
+            }
+        }
+        let file_paths = Self::find_supported_files(repo_root, &self.registry).unwrap_or_default();
+        self.get_or_build_graph_topology(repo_root, &file_paths).await
+    }
 }
 
 #[tool_router]
@@ -485,6 +605,7 @@ impl SemServer {
             ))),
             graph_cache: Arc::new(Mutex::new(None)),
             topology_cache: Arc::new(Mutex::new(None)),
+            watch: Arc::new(Mutex::new(WatchSlot::default())),
             _tool_router: Self::tool_router(),
         }
     }
@@ -721,10 +842,6 @@ impl SemServer {
             return Ok(tool_error(format!("No parser for file: {}", rel_path)));
         }
 
-        let file_paths = match Self::find_supported_files(&ctx.repo_root, &self.registry) {
-            Ok(file_paths) => file_paths,
-            Err(err) => return Ok(tool_error(err)),
-        };
         let mode = params.mode.as_deref().unwrap_or("all");
         let valid_modes = ["all", "deps", "dependents", "tests"];
         if !valid_modes.contains(&mode) {
@@ -736,9 +853,7 @@ impl SemServer {
         }
 
         if matches!(mode, "deps" | "dependents") {
-            let graph = self
-                .get_or_build_graph_topology(&ctx.repo_root, &file_paths)
-                .await;
+            let graph = self.live_topology(&ctx.repo_root).await;
             let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)
             {
                 Ok(entity_id) => entity_id,
@@ -790,7 +905,7 @@ impl SemServer {
             )]));
         }
 
-        let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
+        let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
 
         let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
             Ok(entity_id) => entity_id,
@@ -1012,11 +1127,7 @@ impl SemServer {
             return Ok(tool_error(format!("No parser for file: {}", rel_path)));
         }
 
-        let file_paths = match Self::find_supported_files(&ctx.repo_root, &self.registry) {
-            Ok(file_paths) => file_paths,
-            Err(err) => return Ok(tool_error(err)),
-        };
-        let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
+        let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
 
         let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
             Ok(entity_id) => entity_id,
@@ -1247,6 +1358,48 @@ mod tests {
         let err = SemServer::find_supported_files(&missing_root, &registry).unwrap_err();
 
         assert!(err.contains("Failed to read directory"));
+    }
+
+    #[tokio::test]
+    async fn live_graph_reflects_working_tree_edits_via_watcher() {
+        // Proves the watcher keeps the in-memory graph in sync with on-disk
+        // edits: after renaming an entity, the live graph must surface the new
+        // name without restarting the server.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("a.rs"), "pub fn alpha() -> i32 { 1 }\n").unwrap();
+
+        let server = SemServer::new();
+
+        // First build seeds the watcher and caches the graph.
+        let (graph, _) = server.live_graph(root).await;
+        assert!(
+            graph.entities.values().any(|e| e.name == "alpha"),
+            "initial graph should contain alpha"
+        );
+        assert!(
+            !graph.entities.values().any(|e| e.name == "beta"),
+            "initial graph should not contain beta"
+        );
+
+        // Edit on disk: rename the entity. content_hash differs, so the change
+        // is detected even within the same mtime tick.
+        std::fs::write(root.join("a.rs"), "pub fn beta() -> i32 { 2 }\n").unwrap();
+
+        // Poll until the watcher delivers the event and the rebuild lands.
+        let mut saw_beta = false;
+        for _ in 0..150 {
+            let (graph, _) = server.live_graph(root).await;
+            if graph.entities.values().any(|e| e.name == "beta") {
+                saw_beta = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            saw_beta,
+            "live graph should reflect the renamed entity after the edit"
+        );
     }
 
     #[test]

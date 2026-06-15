@@ -2,6 +2,7 @@ pub mod cache;
 pub mod server;
 pub mod tools;
 mod transport;
+pub mod watch;
 
 use rmcp::ServiceExt;
 
