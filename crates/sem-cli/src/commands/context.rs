@@ -104,7 +104,6 @@ pub fn context_command(opts: ContextOptions) {
                 println!("  {}:", role_label);
             }
 
-            let snippet: String = entry.content.lines().next().unwrap_or("").to_string();
             println!(
                 "    {} {} ({}, ~{} tokens)",
                 entry.entity_type.dimmed(),
@@ -112,8 +111,17 @@ pub fn context_command(opts: ContextOptions) {
                 entry.file_path.dimmed(),
                 entry.estimated_tokens,
             );
-            if !snippet.is_empty() {
-                println!("      {}", snippet.dimmed());
+            // The target is what you asked to read: print its full body. Related
+            // entities stay a one-line signature so the context map stays scannable.
+            if entry.role == "target" {
+                for line in entry.content.lines() {
+                    println!("      {line}");
+                }
+            } else {
+                let snippet = entry.content.lines().next().unwrap_or("");
+                if !snippet.is_empty() {
+                    println!("      {}", snippet.dimmed());
+                }
             }
         }
     }
@@ -142,7 +150,7 @@ fn find_entity<'a>(
     let mut matching: Vec<_> = graph
         .entities
         .values()
-        .filter(|e| super::entity_matches_query(e, name))
+        .filter(|e| super::entity_matches_qualified(graph, e, name))
         .collect();
 
     if matching.is_empty() {

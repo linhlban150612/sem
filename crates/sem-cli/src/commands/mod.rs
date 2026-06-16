@@ -117,6 +117,31 @@ pub fn entity_matches_query(entity: &sem_core::parser::graph::EntityInfo, query:
     entity.entity_type == entity_type && entity.name == name
 }
 
+/// Like `entity_matches_query`, but also resolves `Class.method` (or
+/// `Outer.Inner.method`) addressing: `entity` matches `Parent.child` when its
+/// own name is `child` and its parent entity is named `Parent`. Needs the graph
+/// to look up the parent. Agents reach for `Class.method` naturally, so every
+/// entity-addressing command should accept it.
+pub fn entity_matches_qualified(
+    graph: &sem_core::parser::graph::EntityGraph,
+    entity: &sem_core::parser::graph::EntityInfo,
+    query: &str,
+) -> bool {
+    if entity_matches_query(entity, query) {
+        return true;
+    }
+    if let Some((parent_part, child_part)) = query.rsplit_once('.') {
+        if entity.name == child_part {
+            if let Some(pid) = &entity.parent_id {
+                if let Some(parent) = graph.entities.get(pid) {
+                    return parent.name == parent_part;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
     let (entity_type, name) = query.split_once(' ')?;
     if entity_type.is_empty() || name.is_empty() {

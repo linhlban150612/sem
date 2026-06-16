@@ -286,7 +286,7 @@ fn find_entity<'a>(
     let mut matching: Vec<_> = graph
         .entities
         .values()
-        .filter(|e| super::entity_matches_query(e, name))
+        .filter(|e| super::entity_matches_qualified(graph, e, name))
         .collect();
 
     if matching.is_empty() {
