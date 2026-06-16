@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows, the MCP tools `sem_impact`, `sem_context`, and `sem_log` never resolved an entity: `resolve_file_path` returned OS-native (backslash) relative paths while graph entities store forward-slash `file_path`s, so the `(name, file_path)` match always failed. Relative paths are now emitted with forward slashes on all platforms.
+
 ## [0.12.0] - 2026-06-15
 
 ### Added
