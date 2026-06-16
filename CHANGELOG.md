@@ -19,7 +19,6 @@ All notable changes to sem are documented in this file.
 ### Fixed
 
 - Fixed: `super::module::func()` calls were dropped from the entity graph, so `impact` and `context` under-reported the blast radius across modules. Multi-segment Rust path-prefixed calls (`super::`/`crate::`/`self::`) now resolve to the real entity.
-- Fixed: method calls on a local whose type couldn't be inferred (e.g. `let g = build(); g.method()`) were dropped, so `impact` and `context` under-reported dependents. When exactly one class in the graph defines a method with that name, the call now resolves to it. The fallback is precise: ambiguous names, and receivers that are known class/import names or instance attributes of the enclosing class, are left to the existing type-tracking paths, so it never guesses on common names like `get` or `new`.
 
 ## [0.11.1] - 2026-06-14
 

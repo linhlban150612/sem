@@ -6957,56 +6957,6 @@ class Transaction {
     }
 
     #[test]
-    fn test_method_call_on_opaque_local_resolves_by_unique_name() {
-        // A method called on a local whose type can't be inferred should still
-        // resolve when exactly one class in the graph defines a method with that
-        // name. This is the cross-file / typed-local case where `impact`
-        // previously reported zero dependents (e.g. `let g = build(); g.foo()`).
-        let (dir, registry) = create_test_repo();
-        let root = dir.path();
-
-        write_file(
-            root,
-            "graph.rs",
-            "\
-pub struct EntityGraph {}
-impl EntityGraph {
-    pub fn impact_analysis(&self, id: &str) -> usize { id.len() }
-}
-pub fn build_graph() -> EntityGraph { EntityGraph {} }
-",
-        );
-        write_file(
-            root,
-            "caller.rs",
-            "\
-use crate::{EntityGraph, build_graph};
-pub fn run_analysis() -> usize {
-    let g = build_graph();
-    g.impact_analysis(\"abc\")
-}
-",
-        );
-
-        let (graph, _) =
-            EntityGraph::build(root, &["graph.rs".into(), "caller.rs".into()], &registry);
-
-        let run_id = graph
-            .entities
-            .keys()
-            .find(|id| id.contains("run_analysis"))
-            .expect("run_analysis entity should exist");
-        let deps = graph.get_dependencies(run_id);
-        assert!(
-            deps.iter().any(|d| d.name == "impact_analysis"),
-            "g.impact_analysis() should resolve to the unique method. Deps: {:?}",
-            deps.iter()
-                .map(|d| (&d.name, &d.file_path))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn test_dot_chain_class_static() {
         let (dir, registry) = create_test_repo();
         let root = dir.path();
