@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-06-16
+
 ### Fixed
 
 - Kotlin: resolve method calls through typed receivers that the `tree-sitter-kotlin-ng` grammar exposes positionally (no `name`/`type` fields). Several scope-resolution paths used field names from the older grammar and silently produced no call edges. Fixed: typed function parameters (`fun f(s: Scenario) { s.method() }`); class field types from property declarations (`val conn: Connection`) and primary-constructor properties (`class Tx(val conn: Connection)`); chained field access (`val s = container.scenario; s.method()`); and declared/inferred return types, so `val c = get(); c.method()` resolves. `sem context`/`impact`/`log` now find these Kotlin callers. Thanks @mrsirrisrm.
