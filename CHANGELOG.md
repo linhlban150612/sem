@@ -4,6 +4,10 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add an agent skill documenting sem's semantic diff, impact, blame, history, context, graph, JSON, and MCP workflows.
+
 ## [0.13.0] - 2026-06-16
 
 ### Fixed
