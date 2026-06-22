@@ -22,6 +22,7 @@ All notable changes to sem are documented in this file.
 ### Fixed
 
 - Intel macOS (`x86_64-apple-darwin`) is now built and published. The release matrix only produced Apple Silicon (`arm64`) macOS binaries, so Intel Mac users got a 404 from `install.sh` and "Unsupported platform darwin:x64" from npm. Added the `x86_64-apple-darwin` target to the release build and the `darwin:x64` mapping to the npm wrapper. Thanks @stark-bit for the report (#374).
+- TOML array-of-tables entries no longer collapse to a single entity in `sem diff`. Repeated `[[array]]` headers all reduced to the same id (`...::property::array`), so appending an entry showed up as a modification of the previous one instead of an addition. Each `[[key]]` entry now gets an index-based identity (`key/0`, `key/1`, ...) and is hashed independently, mirroring the JSON array-index handling. This also stops a `[key]` table and a `[[key]]` array-of-tables with the same name from colliding. Thanks @Arpafaucon for the report and analysis (#362).
 
 ## [0.13.0] - 2026-06-16
 
