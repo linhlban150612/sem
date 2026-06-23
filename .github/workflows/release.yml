@@ -94,7 +94,10 @@ jobs:
             os: macos-14
             name: sem-darwin-arm64
           - target: x86_64-apple-darwin
-            os: macos-13
+            # Cross-compile on Apple Silicon: macOS clang targets x86_64 natively,
+            # and macos-14 runners are plentiful (Intel macos-13 runners are scarce
+            # and being retired, which can leave the build queued indefinitely).
+            os: macos-14
             name: sem-darwin-x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-latest

@@ -4,6 +4,8 @@ All notable changes to sem are documented in this file.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-23
+
 ### Added
 
 - `sem orient <query>` finds the entities most relevant to a query, structural code search for when you're dropped into an unfamiliar codebase and don't know the symbol name yet (e.g. `sem orient "where is the retry logic"`). Two-pass ranking: lexical score over entity name (subtoken + prefix/stem + substring), file path, and signature line, then a graph-centrality re-rank so a central, widely-used entity outranks a trivially-named helper. Results show the entity, its `file:line`, signature, and dependent count. `--json` and `--limit` supported. This is the structural counterpart to grep: grep finds text, orient finds the entity and how connected it is.
@@ -11,6 +13,10 @@ All notable changes to sem are documented in this file.
 - `sem orient` down-weights entities in test files so implementation outranks an equivalently-named test. Test functions often match a query strongly by name, but the implementation is almost always what you want; tests stay findable, just below the real code.
 - `sem entities` accepts `--only <kind>` and `--except <kind>` (both repeatable) to filter the listing by entity kind, e.g. `sem entities --only function --only struct` or `sem entities --except import`. The two flags are mutually exclusive. Because entity kinds are language-dependent, an unknown kind reports the kinds actually found in the scanned files rather than guessing a static list. Thanks @aleclarson for the request (#378).
 - `SEM_WIDTH` sets the terminal-diff box width. sem's per-file box was a fixed 55 columns with no TTY attached, so it didn't match the surrounding pane when used as a pager (e.g. `lazygit`). Set `SEM_WIDTH=<columns>` to control it. Thanks @franky47 for the request (#380).
+
+### Fixed
+
+- The Intel macOS binary now builds reliably. The release built `x86_64-apple-darwin` on a native Intel `macos-13` runner, which GitHub is retiring, so the job could queue indefinitely and stall the whole release (0.13.1's binaries never published for this reason). It now cross-compiles on Apple Silicon `macos-14`, where runners are plentiful. 0.14.0 is the first release to ship Intel macOS binaries.
 
 ## [0.13.1] - 2026-06-23
 
