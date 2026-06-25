@@ -93,6 +93,15 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             name: sem-darwin-arm64
+          - target: x86_64-apple-darwin
+            # Cross-compile on Apple Silicon: macOS clang targets x86_64 natively,
+            # and macos-14 runners are plentiful (Intel macos-13 runners are scarce
+            # and being retired, which can leave the build queued indefinitely).
+            os: macos-14
+            name: sem-darwin-x86_64
+            # Cross-compiling can't find a target-arch OpenSSL, so vendor + build
+            # it from source for x86_64 (same as the Linux arm64 cross-build).
+            vendor_openssl: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: sem-windows-x86_64

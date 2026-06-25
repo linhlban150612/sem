@@ -1,6 +1,7 @@
 mod cache;
 mod commands;
 mod formatters;
+mod hyperlinks;
 mod progress;
 mod stats;
 mod telemetry;
@@ -20,6 +21,7 @@ use commands::entities::{entities_command, EntitiesOptions};
 use commands::graph::{graph_command, GraphOptions};
 use commands::impact::{impact_command, ImpactMode, ImpactOptions};
 use commands::log::{log_command, LogOptions};
+use commands::orient::{orient_command, OrientOptions};
 
 #[derive(Parser)]
 #[command(name = "sem", version = env!("CARGO_PKG_VERSION"), about = "Semantic version control")]
@@ -157,7 +159,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -183,7 +185,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -241,7 +243,51 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
+        #[arg(long)]
+        no_default_excludes: bool,
+
+        /// Only include files with these extensions (e.g. --file-exts .ts .tsx)
+        #[arg(long, num_args = 1..)]
+        file_exts: Vec<String>,
+
+        /// List only entities of these kinds (repeatable), e.g. --only function --only struct.
+        /// Kinds are language-dependent; an unknown kind reports the kinds found.
+        #[arg(long = "only", value_name = "KIND")]
+        only_kinds: Vec<String>,
+
+        /// List all entities except these kinds (repeatable), e.g. --except import.
+        /// Cannot be combined with --only.
+        #[arg(long = "except", value_name = "KIND", conflicts_with = "only_kinds")]
+        except_kinds: Vec<String>,
+    },
+    /// Find the entities most relevant to a query (structural code search)
+    Orient {
+        /// What you're looking for, e.g. "where is the retry logic"
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+
+        /// Maximum number of results
+        #[arg(long, default_value = "10")]
+        limit: usize,
+
+        /// Output format
+        #[arg(long, value_parser = ["terminal", "json"])]
+        format: Option<String>,
+
+        /// Output as JSON (shorthand for --format json)
+        #[arg(long)]
+        json: bool,
+
+        /// Only include files with these extensions (e.g. --file-exts .ts .tsx)
+        #[arg(long, num_args = 1..)]
+        file_exts: Vec<String>,
+
+        /// Rebuild the entity graph instead of using a cached one
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Include files and directories excluded by default
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -263,6 +309,10 @@ enum Commands {
         #[arg(long, default_value = "8000")]
         budget: usize,
 
+        /// Bound related entities to this many graph hops from the target (0 = unbounded)
+        #[arg(long, default_value = "0")]
+        hops: usize,
+
         /// Output format
         #[arg(long, value_parser = ["terminal", "json"])]
         format: Option<String>,
@@ -279,7 +329,7 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
-        /// Include directories and generated files that are excluded by default
+        /// Include files and directories excluded by default (generated, fixtures, vendor, benchmarks)
         #[arg(long)]
         no_default_excludes: bool,
     },
@@ -330,6 +380,7 @@ fn telemetry_command_name(command: &Option<Commands>) -> Option<&'static str> {
         Some(Commands::Blame { .. }) => "blame",
         Some(Commands::Log { .. }) => "log",
         Some(Commands::Entities { .. }) => "entities",
+        Some(Commands::Orient { .. }) => "orient",
         Some(Commands::Context { .. }) => "context",
         Some(Commands::Stats) => "stats",
         Some(Commands::Mcp) => "mcp",
@@ -528,6 +579,9 @@ fn main() {
             format,
             json,
             no_default_excludes,
+            file_exts,
+            only_kinds,
+            except_kinds,
         }) => {
             entities_command(EntitiesOptions {
                 cwd: std::env::current_dir()
@@ -537,6 +591,31 @@ fn main() {
                 paths,
                 json: resolve_json(format, json),
                 no_default_excludes,
+                file_exts,
+                only_kinds,
+                except_kinds,
+            });
+        }
+        Some(Commands::Orient {
+            query,
+            limit,
+            format,
+            json,
+            file_exts,
+            no_cache,
+            no_default_excludes,
+        }) => {
+            orient_command(OrientOptions {
+                cwd: std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                query: query.join(" "),
+                limit,
+                json: resolve_json(format, json),
+                file_exts,
+                no_cache,
+                no_default_excludes,
             });
         }
         Some(Commands::Context {
@@ -544,6 +623,7 @@ fn main() {
             entity_id,
             file,
             budget,
+            hops,
             format,
             json,
             file_exts,
@@ -559,6 +639,7 @@ fn main() {
                 entity_id,
                 file_path: file,
                 budget,
+                hops,
                 json: resolve_json(format, json),
                 file_exts,
                 no_cache,

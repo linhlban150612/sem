@@ -25,8 +25,20 @@ use crate::cache;
 use crate::tools::*;
 use crate::watch::{watch_enabled, RepoWatcher};
 
-const MCP_INSTRUCTIONS: &str = "sem MCP server for entity-level semantic code intelligence. \
-                                6 tools: sem_entities, sem_diff, sem_blame, sem_impact, sem_log, sem_context.";
+const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
+    (functions/classes/methods plus a real cross-file call and import graph). \
+    Prefer these over grep/find for structural questions:\n\
+    - \"what calls X / what breaks if I change X\" -> sem_impact (not grep)\n\
+    - \"read / understand the function or class X\" -> sem_context (returns X's full source PLUS its callers and callees, addressed by name, not by line range; use this instead of opening the file to read code)\n\
+    - \"where is X / find the code that does Y\" (you don't know the name) -> sem_entities with a `query` (ranked structural search), not grep\n\
+    - \"list the entities in this file/dir\" -> sem_entities with a `path`\n\
+    - entity-level change review -> sem_diff; who last changed X -> sem_blame; how X evolved -> sem_log\n\
+    Use grep/find only for text/string search, error messages, config keys, \
+    discovery by an unknown name, and non-code files. Open/read a source file \
+    directly only to edit it (editors require reading the file first) or for \
+    non-code/config; to merely understand code, sem_context is faster and arrives \
+    with the dependency context. sem is deterministic and cross-file, so it won't \
+    hallucinate edges or miss callers the way a text search does.";
 
 const ENTITY_LOOKUP_CANDIDATE_LIMIT: usize = 10;
 
@@ -184,6 +196,14 @@ impl SemServer {
     }
 
     fn find_supported_files(root: &Path, registry: &ParserRegistry) -> Result<Vec<String>, String> {
+        Self::find_supported_files_with_options(root, registry, false)
+    }
+
+    fn find_supported_files_with_options(
+        root: &Path,
+        registry: &ParserRegistry,
+        no_default_excludes: bool,
+    ) -> Result<Vec<String>, String> {
         if !root.exists() {
             return Err(format!(
                 "Failed to read directory {}: No such file or directory",
@@ -201,6 +221,7 @@ impl SemServer {
         if semignore.exists() {
             builder.add_ignore(semignore);
         }
+        Self::prune_default_excluded_dirs(&mut builder, root, no_default_excludes);
         let walker = builder.build();
         for entry in walker.flatten() {
             let path = entry.path();
@@ -209,7 +230,9 @@ impl SemServer {
             }
             if let Ok(rel) = path.strip_prefix(root) {
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if is_default_excluded(&rel_str) || is_probably_binary_path(&rel_str) {
+                if (!no_default_excludes && is_default_excluded(&rel_str))
+                    || is_probably_binary_path(&rel_str)
+                {
                     continue;
                 }
                 if registry.get_plugin(&rel_str).is_none() {
@@ -226,10 +249,11 @@ impl SemServer {
     }
 
     /// Walk a subdirectory, returning paths relative to `prefix_root` (e.g. the repo root).
-    fn walk_dir_files(
+    fn walk_dir_files_with_options(
         dir: &Path,
         prefix_root: &Path,
         registry: &ParserRegistry,
+        no_default_excludes: bool,
     ) -> Result<Vec<String>, String> {
         let mut files = Vec::new();
         let mut builder = ignore::WalkBuilder::new(dir);
@@ -242,6 +266,7 @@ impl SemServer {
         if semignore.exists() {
             builder.add_ignore(semignore);
         }
+        Self::prune_default_excluded_dirs(&mut builder, prefix_root, no_default_excludes);
         let walker = builder.build();
         for entry in walker.flatten() {
             let path = entry.path();
@@ -250,7 +275,9 @@ impl SemServer {
             }
             if let Ok(rel) = path.strip_prefix(prefix_root) {
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if is_default_excluded(&rel_str) || is_probably_binary_path(&rel_str) {
+                if (!no_default_excludes && is_default_excluded(&rel_str))
+                    || is_probably_binary_path(&rel_str)
+                {
                     continue;
                 }
                 if registry.get_plugin(&rel_str).is_none() {
@@ -264,6 +291,32 @@ impl SemServer {
         }
         files.sort();
         Ok(files)
+    }
+
+    fn prune_default_excluded_dirs(
+        builder: &mut ignore::WalkBuilder,
+        prefix_root: &Path,
+        no_default_excludes: bool,
+    ) {
+        if no_default_excludes {
+            return;
+        }
+
+        let prefix_root = prefix_root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+            {
+                return true;
+            }
+
+            let Ok(rel) = entry.path().strip_prefix(&prefix_root) else {
+                return true;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            !is_default_excluded(&rel_str)
+        });
     }
 
     fn read_file_at(abs_path: &Path, display_path: &str) -> Result<String, String> {
@@ -372,6 +425,7 @@ impl SemServer {
         &self,
         repo_root: &Path,
         file_paths: &[String],
+        source_scope: cache::CacheSourceScope,
     ) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
         let manifest_hash = cache::compute_manifest_hash(repo_root, file_paths).unwrap_or(0);
 
@@ -388,7 +442,9 @@ impl SemServer {
         // Check SQLite cache (full hit, then incremental)
         if let Ok(disk) = cache::DiskCache::open(repo_root) {
             // Full cache hit
-            if let Some((graph, entities)) = disk.load(repo_root, file_paths) {
+            if let Some((graph, entities)) =
+                disk.load_with_source_scope(repo_root, file_paths, source_scope)
+            {
                 let graph = Arc::new(graph);
                 let entities = Arc::new(entities);
                 let mut guard = self.graph_cache.lock().await;
@@ -406,7 +462,9 @@ impl SemServer {
             }
 
             // Incremental: load clean cached data, rebuild only stale files
-            if let Some(partial) = disk.load_partial(repo_root, file_paths) {
+            if let Some(partial) =
+                disk.load_partial_with_source_scope(repo_root, file_paths, source_scope)
+            {
                 let (graph, entities, metadata) =
                     EntityGraph::build_incremental_with_metadata_and_import_candidates(
                         repo_root,
@@ -427,6 +485,7 @@ impl SemServer {
                     metadata.repaired_clean_entity_ids,
                     &metadata.recomputed_edge_source_ids,
                     &metadata.deleted_entity_ids,
+                    source_scope,
                 );
 
                 let graph = Arc::new(graph);
@@ -451,7 +510,7 @@ impl SemServer {
 
         // Persist to SQLite (best-effort)
         if let Ok(disk) = cache::DiskCache::open(repo_root) {
-            let _ = disk.save(repo_root, file_paths, &graph, &entities);
+            let _ = disk.save(repo_root, file_paths, &graph, &entities, source_scope);
         }
 
         let graph = Arc::new(graph);
@@ -481,6 +540,7 @@ impl SemServer {
         &self,
         repo_root: &Path,
         file_paths: &[String],
+        source_scope: cache::CacheSourceScope,
     ) -> Arc<EntityGraph> {
         let manifest_hash = cache::compute_manifest_hash(repo_root, file_paths).unwrap_or(0);
 
@@ -503,7 +563,9 @@ impl SemServer {
         }
 
         if let Ok(disk) = cache::DiskCache::open(repo_root) {
-            if let Some(graph) = disk.load_graph_topology(repo_root, file_paths) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(repo_root, file_paths, source_scope)
+            {
                 let graph = Arc::new(graph);
                 let mut guard = self.topology_cache.lock().await;
                 *guard = Some(CachedTopology {
@@ -514,8 +576,18 @@ impl SemServer {
             }
         }
 
-        let (graph, _) = self.get_or_build_graph(repo_root, file_paths).await;
+        let (graph, _) = self
+            .get_or_build_graph(repo_root, file_paths, source_scope)
+            .await;
         graph
+    }
+
+    fn cache_source_scope(repo_root: &Path, no_default_excludes: bool) -> cache::CacheSourceScope {
+        if no_default_excludes || repo_root.join(".semignore").exists() {
+            cache::CacheSourceScope::Custom
+        } else {
+            cache::CacheSourceScope::Default
+        }
     }
 
     /// Ensure the in-memory whole-repo caches are fresh with respect to the file
@@ -567,17 +639,17 @@ impl SemServer {
 
         // Rebuild (incrementally, via the disk cache) and repopulate the memory
         // caches that live_graph / live_topology read from.
-        let _ = self.get_or_build_graph(repo_root, &file_paths).await;
+        let source_scope = Self::cache_source_scope(repo_root, false);
+        let _ = self
+            .get_or_build_graph(repo_root, &file_paths, source_scope)
+            .await;
         slot.last_built_generation = drained.generation;
         slot.built_once = true;
         Some(file_paths)
     }
 
     /// Whole-repo (graph, entities), kept hot by the file watcher when active.
-    async fn live_graph(
-        &self,
-        repo_root: &Path,
-    ) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
+    async fn live_graph(&self, repo_root: &Path) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
         if self.ensure_live(repo_root).await.is_some() {
             let guard = self.graph_cache.lock().await;
             if let Some(ref cached) = *guard {
@@ -585,7 +657,9 @@ impl SemServer {
             }
         }
         let file_paths = Self::find_supported_files(repo_root, &self.registry).unwrap_or_default();
-        self.get_or_build_graph(repo_root, &file_paths).await
+        let source_scope = Self::cache_source_scope(repo_root, false);
+        self.get_or_build_graph(repo_root, &file_paths, source_scope)
+            .await
     }
 
     /// Whole-repo graph topology, kept hot by the file watcher when active.
@@ -605,7 +679,9 @@ impl SemServer {
             }
         }
         let file_paths = Self::find_supported_files(repo_root, &self.registry).unwrap_or_default();
-        self.get_or_build_graph_topology(repo_root, &file_paths).await
+        let source_scope = Self::cache_source_scope(repo_root, false);
+        self.get_or_build_graph_topology(repo_root, &file_paths, source_scope)
+            .await
     }
 }
 
@@ -628,7 +704,7 @@ impl SemServer {
     // ── Tool 1: Entities ──
 
     #[tool(
-        description = "List semantic entities (functions, classes, etc.) under a file or directory path. Defaults to '.'."
+        description = "List semantic entities (functions, classes, etc.) under a file or directory path (defaults to '.'). Pass `query` to instead search the whole repo by intent and find the most relevant entities when you don't know the name (prefer this over grep for \"where is X\")."
     )]
     async fn sem_entities(
         &self,
@@ -640,8 +716,43 @@ impl SemServer {
             Err(err) => return Ok(tool_error(err)),
         };
 
+        // Query mode: rank the whole-repo entity graph by relevance to the
+        // query (structural search), instead of listing a path.
+        if let Some(query) = params.query() {
+            let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
+            let hits = sem_core::parser::orient::orient(
+                &all_entities,
+                &graph,
+                query,
+                params.limit(),
+            );
+            let result: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "name": h.name,
+                        "type": h.entity_type,
+                        "file": h.file_path,
+                        "start_line": h.start_line,
+                        "signature": h.signature,
+                        "dependents": h.dependents,
+                        "dependencies": h.dependencies,
+                    })
+                })
+                .collect();
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )]));
+        }
+
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);
         let (entities, include_file) = if abs_path.is_file() {
+            if !params.no_default_excludes() && is_default_excluded(&rel_path) {
+                return Ok(tool_error(format!(
+                    "Path is excluded by default: {}",
+                    rel_path
+                )));
+            }
             let content = match Self::read_file_at(&abs_path, &rel_path) {
                 Ok(content) => content,
                 Err(err) => return Ok(tool_error(err)),
@@ -655,7 +766,12 @@ impl SemServer {
             }
             (entities, false)
         } else if abs_path.is_dir() {
-            let file_paths = match Self::walk_dir_files(&abs_path, &ctx.repo_root, &self.registry) {
+            let file_paths = match Self::walk_dir_files_with_options(
+                &abs_path,
+                &ctx.repo_root,
+                &self.registry,
+                params.no_default_excludes(),
+            ) {
                 Ok(file_paths) => file_paths,
                 Err(err) => return Ok(tool_error(err)),
             };
@@ -856,6 +972,7 @@ impl SemServer {
         if self.registry.get_plugin(&rel_path).is_none() {
             return Ok(tool_error(format!("No parser for file: {}", rel_path)));
         }
+        let no_default_excludes = params.no_default_excludes.unwrap_or(false);
 
         let mode = params.mode.as_deref().unwrap_or("all");
         let valid_modes = ["all", "deps", "dependents", "tests"];
@@ -868,7 +985,21 @@ impl SemServer {
         }
 
         if matches!(mode, "deps" | "dependents") {
-            let graph = self.live_topology(&ctx.repo_root).await;
+            let graph = if no_default_excludes {
+                let file_paths = match Self::find_supported_files_with_options(
+                    &ctx.repo_root,
+                    &self.registry,
+                    no_default_excludes,
+                ) {
+                    Ok(file_paths) => file_paths,
+                    Err(err) => return Ok(tool_error(err)),
+                };
+                let source_scope = Self::cache_source_scope(&ctx.repo_root, no_default_excludes);
+                self.get_or_build_graph_topology(&ctx.repo_root, &file_paths, source_scope)
+                    .await
+            } else {
+                self.live_topology(&ctx.repo_root).await
+            };
             let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)
             {
                 Ok(entity_id) => entity_id,
@@ -920,7 +1051,21 @@ impl SemServer {
             )]));
         }
 
-        let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
+        let (graph, all_entities) = if no_default_excludes {
+            let file_paths = match Self::find_supported_files_with_options(
+                &ctx.repo_root,
+                &self.registry,
+                no_default_excludes,
+            ) {
+                Ok(file_paths) => file_paths,
+                Err(err) => return Ok(tool_error(err)),
+            };
+            let source_scope = Self::cache_source_scope(&ctx.repo_root, no_default_excludes);
+            self.get_or_build_graph(&ctx.repo_root, &file_paths, source_scope)
+                .await
+        } else {
+            self.live_graph(&ctx.repo_root).await
+        };
 
         let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
             Ok(entity_id) => entity_id,
@@ -929,7 +1074,11 @@ impl SemServer {
 
         let output = match mode {
             "tests" => {
-                let tests = graph.test_impact_with_custom_dirs(entity_id, &all_entities, &self.registry.custom_test_dirs);
+                let tests = graph.test_impact_with_custom_dirs(
+                    entity_id,
+                    &all_entities,
+                    &self.registry.custom_test_dirs,
+                );
                 let result: Vec<serde_json::Value> = tests
                     .iter()
                     .map(|d| {
@@ -953,7 +1102,11 @@ impl SemServer {
                 let deps = graph.get_dependencies(entity_id);
                 let dependents = graph.get_dependents(entity_id);
                 let impact = graph.impact_analysis(entity_id);
-                let tests = graph.test_impact_with_custom_dirs(entity_id, &all_entities, &self.registry.custom_test_dirs);
+                let tests = graph.test_impact_with_custom_dirs(
+                    entity_id,
+                    &all_entities,
+                    &self.registry.custom_test_dirs,
+                );
 
                 let map_entities =
                     |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
@@ -1141,8 +1294,23 @@ impl SemServer {
         if self.registry.get_plugin(&rel_path).is_none() {
             return Ok(tool_error(format!("No parser for file: {}", rel_path)));
         }
+        let no_default_excludes = params.no_default_excludes.unwrap_or(false);
 
-        let (graph, all_entities) = self.live_graph(&ctx.repo_root).await;
+        let (graph, all_entities) = if no_default_excludes {
+            let file_paths = match Self::find_supported_files_with_options(
+                &ctx.repo_root,
+                &self.registry,
+                no_default_excludes,
+            ) {
+                Ok(file_paths) => file_paths,
+                Err(err) => return Ok(tool_error(err)),
+            };
+            let source_scope = Self::cache_source_scope(&ctx.repo_root, no_default_excludes);
+            self.get_or_build_graph(&ctx.repo_root, &file_paths, source_scope)
+                .await
+        } else {
+            self.live_graph(&ctx.repo_root).await
+        };
 
         let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
             Ok(entity_id) => entity_id,
@@ -1150,11 +1318,13 @@ impl SemServer {
         };
 
         let budget = params.token_budget.unwrap_or(8000);
-        let context_result = sem_core::parser::context::build_context_result(
+        let hops = params.hops.unwrap_or(0);
+        let context_result = sem_core::parser::context::build_context_result_bounded(
             &graph,
             entity_id,
             &all_entities,
             budget,
+            hops,
         );
 
         let result: Vec<serde_json::Value> = context_result
@@ -1501,10 +1671,31 @@ mod tests {
     fn find_supported_files_skips_binary_and_default_excludes() {
         let root = temp_dir();
         fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src/generated")).unwrap();
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::write(root.join("src/app.js"), "export function app() {}\n").unwrap();
         fs::write(root.join("src/blob.weird"), b"abc\0def").unwrap();
         fs::write(root.join("src/icon.png"), b"\x89PNG\r\n").unwrap();
+        fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedSchema() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/api.generated.ts"),
+            "export function generatedApi() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/styles.module.scss.d.ts"),
+            "declare const styles: Record<string, string>;\nexport default styles;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/logo.svg.d.ts"),
+            "declare const src: string;\nexport default src;\n",
+        )
+        .unwrap();
         fs::write(
             root.join("dist/generated.js"),
             "export function generated() {}\n",
@@ -1515,6 +1706,17 @@ mod tests {
         let files = SemServer::find_supported_files(&root, &registry).unwrap();
 
         assert_eq!(files, vec!["src/app.js".to_string()]);
+
+        let files_with_generated =
+            SemServer::find_supported_files_with_options(&root, &registry, true).unwrap();
+        assert!(files_with_generated.contains(&"src/app.js".to_string()));
+        assert!(files_with_generated.contains(&"src/generated/schema.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/api.generated.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/styles.module.scss.d.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/logo.svg.d.ts".to_string()));
+        assert!(files_with_generated.contains(&"dist/generated.js".to_string()));
+        assert!(!files_with_generated.contains(&"src/blob.weird".to_string()));
+        assert!(!files_with_generated.contains(&"src/icon.png".to_string()));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1578,11 +1780,61 @@ mod tests {
         let result = server
             .sem_entities(Parameters(EntitiesParams {
                 path: Some(missing_path.display().to_string()),
+                no_default_excludes: None,
+                query: None,
+                limit: None,
             }))
             .await
             .unwrap();
 
         assert_tool_error(result, "Path not found:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_entities_can_opt_into_generated_file_path() {
+        let root = temp_git_repo("generated-entities-file");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        std::fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedTarget() { return 1; }\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let default_result = server
+            .sem_entities(Parameters(EntitiesParams {
+                path: Some("src/generated/schema.ts".to_string()),
+                no_default_excludes: None,
+                query: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert_tool_error(default_result, "Path is excluded by default:");
+
+        let opt_in_result = server
+            .sem_entities(Parameters(EntitiesParams {
+                path: Some("src/generated/schema.ts".to_string()),
+                no_default_excludes: Some(true),
+                query: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        let text = match &opt_in_result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(text) => &text.text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            payload.as_array().unwrap().iter().any(|entity| {
+                entity["name"] == "generatedTarget" && entity["type"] == "function"
+            }),
+            "generated target should be returned when default excludes are disabled: {payload}"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1678,6 +1930,7 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "nonexistent_zzz".to_string(),
                 mode: None,
+                no_default_excludes: None,
             }))
             .await
             .unwrap();
@@ -1697,6 +1950,7 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "anything".to_string(),
                 mode: None,
+                no_default_excludes: None,
             }))
             .await
             .unwrap();
@@ -1722,6 +1976,7 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "known_entity".to_string(),
                 mode: None,
+                no_default_excludes: None,
             }))
             .await
             .unwrap();
@@ -1748,6 +2003,72 @@ mod tests {
                 file_path: "./sample.py".to_string(),
                 entity_name: "known_entity".to_string(),
                 mode: Some("deps".to_string()),
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_can_opt_into_generated_files() {
+        let root = temp_git_repo("generated-impact-file");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        std::fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedTarget() { return 1; }\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let default_result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: "src/generated/schema.ts".to_string(),
+                entity_name: "generatedTarget".to_string(),
+                mode: Some("deps".to_string()),
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+        assert_tool_error(
+            default_result,
+            "Entity 'generatedTarget' not found in 'src/generated/schema.ts'",
+        );
+
+        let opt_in_result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: "src/generated/schema.ts".to_string(),
+                entity_name: "generatedTarget".to_string(),
+                mode: Some("deps".to_string()),
+                no_default_excludes: Some(true),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(opt_in_result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_context_can_opt_into_generated_files() {
+        let root = temp_git_repo("generated-context-file");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        std::fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedTarget() { return 1; }\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_context(Parameters(ContextParams {
+                file_path: "src/generated/schema.ts".to_string(),
+                entity_name: "generatedTarget".to_string(),
+                token_budget: Some(2000),
+                hops: None,
+                no_default_excludes: Some(true),
             }))
             .await
             .unwrap();
@@ -1773,6 +2094,8 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "known_entity".to_string(),
                 token_budget: None,
+                hops: None,
+                no_default_excludes: None,
             }))
             .await
             .unwrap();
@@ -1796,6 +2119,8 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "nonexistent_zzz".to_string(),
                 token_budget: None,
+                hops: None,
+                no_default_excludes: None,
             }))
             .await
             .unwrap();
@@ -1839,6 +2164,7 @@ mod tests {
                 file_path: file_path.display().to_string(),
                 entity_name: "known_entity".to_string(),
                 mode: Some("invalid".to_string()),
+                no_default_excludes: None,
             }))
             .await
             .unwrap();

@@ -6,7 +6,60 @@ All notable changes to sem are documented in this file.
 
 ### Added
 
-- Add an agent skill documenting sem's semantic diff, impact, blame, history, context, graph, JSON, and MCP workflows.
+- An agent skill (`skills/sem/SKILL.md`) documenting sem's semantic diff, impact, blame, history, context, and graph workflows for coding agents. Thanks @linhlban150612 for the contribution (#376).
+- `self-update` Cargo feature (on by default) gates the built-in `sem update` and the background update-available check. Distro and package-manager builds that own the binary's lifecycle can opt out with `cargo build --no-default-features`; `sem update` then prints a "update through your package manager" message instead of replacing the binary. Thanks @0323pin (pkgsrc/NetBSD) for the request (#390).
+
+### Added
+
+- `sem context --hops N` bounds the related entities to N graph hops from the target (instead of filling to the token budget), so you can ask for "the entity and just its immediate neighborhood." The `sem_context` MCP tool gains the same `hops` parameter. 0 (the default) keeps the existing unbounded, budget-driven behavior.
+
+### Changed
+
+- The `sem mcp` instructions now tell agents to read code with `sem_context` (which returns an entity's full source plus its callers/callees, addressed by name) rather than opening the file, reserving direct file reads for editing and non-code. Reading by entity is robust to line drift and arrives with the dependency context.
+
+## [0.14.1] - 2026-06-23
+
+### Fixed
+
+- Release pipeline: the Intel macOS cross-build failed on `openssl-sys` (no target-arch OpenSSL when cross-compiling on Apple Silicon). It now builds OpenSSL from source via `--features vendored-openssl`, the same approach the Linux arm64 cross-build uses. 0.14.0's binaries never published because of this; 0.14.1 is the first release to ship binaries for every platform, including Intel macOS (#374).
+
+## [0.14.0] - 2026-06-23
+
+### Added
+
+- `sem orient <query>` finds the entities most relevant to a query, structural code search for when you're dropped into an unfamiliar codebase and don't know the symbol name yet (e.g. `sem orient "where is the retry logic"`). Two-pass ranking: lexical score over entity name (subtoken + prefix/stem + substring), file path, and signature line, then a graph-centrality re-rank so a central, widely-used entity outranks a trivially-named helper. Results show the entity, its `file:line`, signature, and dependent count. `--json` and `--limit` supported. This is the structural counterpart to grep: grep finds text, orient finds the entity and how connected it is.
+- The `sem_entities` MCP tool accepts a `query` parameter for the same intent search, so agents can find code by what it does (not just by name) without falling back to grep. The ranking is shared with the CLI (`sem_core::parser::orient`).
+- `sem orient` down-weights entities in test files so implementation outranks an equivalently-named test. Test functions often match a query strongly by name, but the implementation is almost always what you want; tests stay findable, just below the real code.
+- `sem entities` accepts `--only <kind>` and `--except <kind>` (both repeatable) to filter the listing by entity kind, e.g. `sem entities --only function --only struct` or `sem entities --except import`. The two flags are mutually exclusive. Because entity kinds are language-dependent, an unknown kind reports the kinds actually found in the scanned files rather than guessing a static list. Thanks @aleclarson for the request (#378).
+- `SEM_WIDTH` sets the terminal-diff box width. sem's per-file box was a fixed 55 columns with no TTY attached, so it didn't match the surrounding pane when used as a pager (e.g. `lazygit`). Set `SEM_WIDTH=<columns>` to control it. Thanks @franky47 for the request (#380).
+
+### Fixed
+
+- The Intel macOS binary now builds reliably. The release built `x86_64-apple-darwin` on a native Intel `macos-13` runner, which GitHub is retiring, so the job could queue indefinitely and stall the whole release (0.13.1's binaries never published for this reason). It now cross-compiles on Apple Silicon `macos-14`, where runners are plentiful. 0.14.0 is the first release to ship Intel macOS binaries.
+
+## [0.13.1] - 2026-06-23
+
+### Added
+
+- `sem impact` can answer direct dependency queries from a fresh SQL topology cache without rebuilding the entity graph.
+- `sem entities` reports phase timings and listing counters when `SEM_TIMINGS` is enabled.
+- Optional OSC8 terminal hyperlinks on entity names in `sem diff`, so a supporting terminal (kitty, WezTerm, iTerm2, Ghostty, ...) renders them clickable and can open the definition at `file:line`. Off by default; enable with `SEM_HYPERLINK` set to an editor preset (`vscode`, `cursor`, `windsurf`, `zed`, `idea`, `file`) or a raw URI template using `{file}` and `{line}` (e.g. `SEM_HYPERLINK="vscode://file/{file}:{line}"`). Strictly TTY-only, so pipes, JSON output, and MCP/agent sessions never see escape codes. Force off with `SEM_NO_HYPERLINKS=1`. Thanks @olejorgenb for the request (#381).
+
+### Changed
+
+- The `sem mcp` server now sends usage guidance to the agent instead of a bare tool list. The instructions tell the agent to prefer `sem_impact`/`sem_context`/`sem_entities` over grep/find for structural questions (what calls X, understand X, where is X) and to keep grep for text search and non-code files. Availability alone wasn't changing agent behavior; this biases agents toward the entity graph the moment the server connects, with no extra setup.
+- `sem impact --deps` can reuse fresh caches when unrelated files change by validating the cached source set, hashes, and import metadata before falling back to a graph rebuild.
+- `sem impact --deps` narrows cache freshness checks to the queried entity, direct dependencies, and relevant JavaScript/TypeScript imports when the query scope is explicit.
+- Source scans skip default-excluded high-volume paths such as generated source directories, fixture/vendor/benchmark trees, generated file suffixes, CSS module declarations, and asset declarations; pass `--no-default-excludes` to include them.
+- `sem entities` accepts `--file-exts` for large directory scans and avoids duplicate directory-listing post-processing.
+- `sem entities` can list entities from a fresh SQLite topology cache instead of reparsing matching directory scans.
+- `sem entities --json` streams rows to stdout instead of materializing an intermediate JSON value array.
+- `sem entities` uses listing-only extraction so local listings do not retain source text or entity hashes.
+
+### Fixed
+
+- Intel macOS (`x86_64-apple-darwin`) is now built and published. The release matrix only produced Apple Silicon (`arm64`) macOS binaries, so Intel Mac users got a 404 from `install.sh` and "Unsupported platform darwin:x64" from npm. Added the `x86_64-apple-darwin` target to the release build and the `darwin:x64` mapping to the npm wrapper. Thanks @stark-bit for the report (#374).
+- TOML array-of-tables entries no longer collapse to a single entity in `sem diff`. Repeated `[[array]]` headers all reduced to the same id (`...::property::array`), so appending an entry showed up as a modification of the previous one instead of an addition. Each `[[key]]` entry now gets an index-based identity (`key/0`, `key/1`, ...) and is hashed independently, mirroring the JSON array-index handling. This also stops a `[key]` table and a `[[key]]` array-of-tables with the same name from colliding. Thanks @Arpafaucon for the report and analysis (#362).
 
 ## [0.13.0] - 2026-06-16
 
